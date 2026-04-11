@@ -81,3 +81,4 @@ coverage.out
 .cache/
 tmp/
 temp/
+daemon-audit
