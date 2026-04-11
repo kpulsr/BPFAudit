@@ -1,0 +1,83 @@
+# general
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+
+# build artifacts
+*.o
+*.a
+*.so
+*.d
+*.cmd
+*.order
+*.symvers
+
+build/
+dist/
+out/
+
+# kernel module
+*.ko
+*.mod
+*.mod.c
+*.mod.*
+Module.symvers
+modules.order
+
+# ebpf / clang / llvm
+*.bpf.o
+*.ll
+*.bc
+*.s
+*.skel.h
+*.bpf.skel.h
+*.opt.bc
+*.linked.bc
+
+# go
+*.exe
+*.dll
+*.dylib
+*.test
+*.out
+
+bin/
+pkg/
+vendor/
+coverage.out
+
+# docker / images
+*.tar
+*.img
+
+# env / secrets
+.env
+.env.*
+*.key
+*.pem
+*.crt
+
+# archives
+*.zip
+*.tar.gz
+*.tgz
+*.rar
+
+# profiling / debug
+*.prof
+*.pprof
+*.trace
+
+# misc
+.cache/
+tmp/
+temp/
