@@ -23,7 +23,7 @@
  * kfunc exported by bpfledger.ko
  */
 extern void bpfaudit_submit_event(struct audit_record *rec,
-                                  __u32 rec__sz) __ksym;
+                                  __u32 rec__sz, struct bpf_prog *prog) __ksym;
 
 /* ── BPF maps ──────────────────────────────────────────────────────────── */
 
@@ -65,9 +65,8 @@ static __always_inline void inc_counter(void *map) {
  * to be loaded
  * Returns 0... currently only audit no enforcement
  */
-SEC("lsm/bpf_prog_load")
-int BPF_PROG(audit_lsm_prog_load, struct bpf_prog *prog, union bpf_attr *attr,
-             struct bpf_token *token) {
+SEC("lsm/bpf_prog")
+int BPF_PROG(audit_lsm_prog, struct bpf_prog *prog, struct bpf_prog_aux *aux) {
   struct audit_record rec = {};
 
   fill_process_ctx(&rec);
@@ -83,12 +82,12 @@ int BPF_PROG(audit_lsm_prog_load, struct bpf_prog *prog, union bpf_attr *attr,
   }
 
   inc_counter(&lsm_counter);
-  bpfaudit_submit_event(&rec, sizeof(rec));
+  bpfaudit_submit_event(&rec, sizeof(rec),prog);
 
   return 0; /* audit only */
 }
 
-SEC("lsm/bpf_prog_free")
+/*SEC("lsm/bpf_prog_free")
 void BPF_PROG(audit_lsm_prog_free, struct bpf_prog *prog) {
   struct audit_record rec = {};
 
@@ -105,6 +104,6 @@ void BPF_PROG(audit_lsm_prog_free, struct bpf_prog *prog) {
 
   inc_counter(&lsm_counter);
   bpfaudit_submit_event(&rec, sizeof(rec));
-}
+}*/
 
 char LICENSE[] SEC("license") = "GPL";

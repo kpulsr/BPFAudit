@@ -7,28 +7,29 @@ import (
 	"fmt"
 	"log"
 	"os"
-
+    "encoding/hex"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 )
 
 type AuditRecord struct {
-	Seq         uint64
-	TimestampNs uint64
-	PrevHash    uint64
-	CurrHash    uint64
-	Pid         uint32
-	Tgid        uint32
-	Uid         uint32
-	Gid         uint32
-	CgroupId    uint64
-	ProgId      uint32
-	ProgType    uint32
-	EventType   uint8
-	Source      uint8
-	ProgTag     [8]byte
-	Comm        [16]byte
-	Pad         [32]byte
+    Seq          uint64
+    TimestampNs  uint64
+    PrevHash     uint64
+    CurrHash     uint64
+    Pid          uint32
+    Tgid         uint32
+    Uid          uint32
+    Gid          uint32
+    CgroupId     uint64
+    ProgId       uint32
+    ProgType     uint32
+    EventType    uint8
+    Source       uint8
+    ProgTag      [8]byte
+    Comm         [16]byte
+    BytecodeHash [32]byte
+	Pad          [6]byte 
 }
 
 type Config struct {
@@ -96,7 +97,7 @@ func RunReader(dev *os.File, readCounter func() (uint64), eventLog *os.File) {
 		lsm := readCounter()
 
 		line := fmt.Sprintf(
-			"seq=%-4d pid=%-6d uid=%-6d comm=%-16s event=%d source=%d hash=%016x | lsm=%-4d \n",
+			"seq=%-4d pid=%-6d uid=%-6d comm=%-16s event=%d source=%d hash=%016x blake2s=%s | lsm=%-4d \n",
 			rec.Seq,
 			rec.Pid,
 			rec.Uid,
@@ -104,6 +105,7 @@ func RunReader(dev *os.File, readCounter func() (uint64), eventLog *os.File) {
 			rec.EventType,
 			rec.Source,
 			rec.CurrHash,
+			hex.EncodeToString(rec.BytecodeHash[:]),
 			lsm,
 		)
 
@@ -190,7 +192,7 @@ func LoadBPF(cfg *Config) (*ebpf.Collection, link.Link, error) {
 		return nil, nil, fmt.Errorf("new collection: %w", err)
 	}
 
-	lsmProg := coll.Programs["audit_lsm_prog_load"]
+	lsmProg := coll.Programs["audit_lsm_prog"]
 
 	if lsmProg == nil {
 		coll.Close()
