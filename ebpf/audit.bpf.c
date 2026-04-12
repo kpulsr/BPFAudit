@@ -2,18 +2,17 @@
 /*
  * BPFAudit — BPF-side hooks
  *
- * Two independent paths, both calling bpfaudit_submit_event() kfunc
+ * Single path calling bpfaudit_submit_event() kfunc
  * which lives in bpfledger.ko:
  *
- *   Path A: LSM hook  lsm/bpf_prog_load    — synchronous, gets full prog info
- *   Path B: kprobe    bpf_prog_load        — independent, cross-validation
+ *   Path : LSM hook  lsm/bpf_prog_load    — synchronous, gets full prog info
  *
- * The kfunc call is the ONLY write path into the kernel-side ledger
+ * The kfunc call is the ONLY write path into the kernel-side ring buffer
  * Userspace cannot write to /dev/bpfledger at all
  */
 
-#include "bpfledger.h"
 #include "vmlinux.h"
+#include "bpfledger.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -37,13 +36,6 @@ struct {
   __type(value, __u64);
 } lsm_counter SEC(".maps");
 
-struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
-  __type(key, __u32);
-  __type(value, __u64);
-} kprobe_counter SEC(".maps");
-
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
 static __always_inline void fill_process_ctx(struct audit_record *rec) {
@@ -66,7 +58,7 @@ static __always_inline void inc_counter(void *map) {
     __sync_fetch_and_add(val, 1);
 }
 
-/* ── Path A: LSM hook ──────────────────────────────────────────────────── */
+/* ── LSM hook ──────────────────────────────────────────────────── */
 
 /*
  * Fires synchronously when any BPF program passes the verifier and is about
@@ -113,28 +105,6 @@ void BPF_PROG(audit_lsm_prog_free, struct bpf_prog *prog) {
 
   inc_counter(&lsm_counter);
   bpfaudit_submit_event(&rec, sizeof(rec));
-}
-
-/* ── Path B: kprobe — independent cross-validation ─────────────────────── */
-
-/*
- * Attaches to the kernel's bpf_prog_load() function via kprobe
- * so we record minimal context. Sufficient for counting/cross-validation.
- */
-SEC("kprobe/bpf_prog_load")
-int BPF_KPROBE(audit_kprobe_prog_load) {
-  struct audit_record rec = {};
-
-  fill_process_ctx(&rec);
-
-  rec.event_type = AUDIT_EVENT_LOAD;
-  rec.source = AUDIT_SOURCE_KPROBE;
-  /* prog_type/prog_id not available at kprobe entry left zero */
-
-  inc_counter(&kprobe_counter);
-  bpfaudit_submit_event(&rec, sizeof(rec));
-
-  return 0;
 }
 
 char LICENSE[] SEC("license") = "GPL";

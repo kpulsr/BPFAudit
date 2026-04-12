@@ -12,7 +12,6 @@
 #endif
 /* Event sources */
 #define AUDIT_SOURCE_LSM    0   /* Came from BPF LSM hook     */
-#define AUDIT_SOURCE_KPROBE 1   /* Came from kprobe/fentry    */
 
 /* Event types */
 #define AUDIT_EVENT_LOAD    1
@@ -43,7 +42,7 @@ struct audit_record {
 	__u32 prog_id;
 	__u32 prog_type;
 	__u8  event_type;                   /* AUDIT_EVENT_LOAD / UNLOAD         */
-	__u8  source;                       /* AUDIT_SOURCE_LSM / KPROBE         */
+	__u8  source;                       /* AUDIT_SOURCE_LSM */
 	__u8  prog_tag[AUDIT_PROG_TAG_SIZE];
 	char  comm[AUDIT_COMM_SIZE];
 
