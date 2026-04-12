@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"unsafe"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -29,12 +30,13 @@ type AuditRecord struct {
     ProgTag      [8]byte
     Comm         [16]byte
     BytecodeHash [32]byte
+	Extra        [64]byte
 	Pad          [6]byte 
 }
 
 type Config struct {
 	BPF struct {
-		LSM     link.Link
+		LSM     []link.Link
 		BPFPATH *string
 	}
 
@@ -46,41 +48,39 @@ type Config struct {
 	Device *os.File
 }
 
+
+func init() {
+    if unsafe.Sizeof(AuditRecord{}) != 192 {
+        panic(fmt.Sprintf("AuditRecord size mismatch: %d", unsafe.Sizeof(AuditRecord{})))
+    }
+}
+
 func main() {
 	cfg, err := ParseFlags()
 	if err != nil {
 		log.Fatalf("parsing flags: %v", err)
 	}
 
-	coll, lsmLink, err := LoadBPF(&cfg)
+	coll, links , err := LoadBPF(&cfg)
 	if err != nil {
 		log.Fatalf("load BPF: %v", err)
 	}
 
-	cfg.BPF.LSM = lsmLink
+	cfg.BPF.LSM = links
 
 	defer coll.Close()
 	defer cfg.Close()
 
-	lsmMap := coll.Maps["lsm_counter"]
-	key := uint32(0)
 
-	readCounter := func() (lsm uint64) {
-		if lsmMap != nil {
-			lsmMap.Lookup(&key, &lsm)
-		}
-		return
-	}
-
-	RunReader(cfg.Device, readCounter, cfg.Logs.Event)
+	RunReader(cfg.Device, cfg.Logs.Event)
 }
 
 // ---------------- Reader ----------------
 
-func RunReader(dev *os.File, readCounter func() (uint64), eventLog *os.File) {
+func RunReader(dev *os.File, eventLog *os.File) {
 	log.Println("device open, reading events...")
 
-	buf := make([]byte, 128)
+	buf := make([]byte, 192)
 
 	for {
 		_, err := dev.Read(buf)
@@ -94,10 +94,18 @@ func RunReader(dev *os.File, readCounter func() (uint64), eventLog *os.File) {
 			continue
 		}
 
-		lsm := readCounter()
+        extraStr := ""
+		switch rec.EventType {
+			case 2, 3: // PIN, GET
+    			extraStr = fmt.Sprintf("path=%s",
+        		string(bytes.TrimRight(rec.Extra[:], "\x00")))
+			case 4, 5: // ATTACH, DETACH
+    			progFd := binary.LittleEndian.Uint32(rec.Extra[:4])
+    			extraStr = fmt.Sprintf("prog_fd=%d", progFd)
+		}
 
 		line := fmt.Sprintf(
-			"seq=%-4d pid=%-6d uid=%-6d comm=%-16s event=%d source=%d hash=%016x blake2s=%s | lsm=%-4d \n",
+			"seq=%-4d pid=%-6d uid=%-6d comm=%-16s event=%d source=%d hash=%016x blake2b=%s %s \n",
 			rec.Seq,
 			rec.Pid,
 			rec.Uid,
@@ -106,7 +114,7 @@ func RunReader(dev *os.File, readCounter func() (uint64), eventLog *os.File) {
 			rec.Source,
 			rec.CurrHash,
 			hex.EncodeToString(rec.BytecodeHash[:]),
-			lsm,
+			extraStr, 
 		)
 
 		// stdout
@@ -160,52 +168,62 @@ func ParseFlags() (Config, error) {
 }
 
 func (c *Config) Close() {
-	if c.BPF.LSM != nil {
-		c.BPF.LSM.Close()
-	}
-	if c.Logs.Event != nil {
-		c.Logs.Event.Close()
-	}
-	if c.Logs.Alert != nil {
-		c.Logs.Alert.Close()
-	}
-	if c.Device != nil {
-		c.Device.Close()
-	}
+    for _, l := range c.BPF.LSM {
+        if l != nil {
+            l.Close()
+        }
+    }
+    if c.Logs.Event != nil {
+        c.Logs.Event.Close()
+    }
+    if c.Logs.Alert != nil {
+        c.Logs.Alert.Close()
+    }
+    if c.Device != nil {
+        c.Device.Close()
+    }
 }
 
 // ---------------- BPF ----------------
 
-func LoadBPF(cfg *Config) (*ebpf.Collection, link.Link, error) {
+func LoadBPF(cfg *Config) (*ebpf.Collection, []link.Link , error) {
+    path := *cfg.BPF.BPFPATH
+    log.Printf("loading BPF from %s", path)
 
-	path := *cfg.BPF.BPFPATH
+    spec, err := ebpf.LoadCollectionSpec(path)
+    if err != nil {
+        return nil, nil, fmt.Errorf("load spec: %w", err)
+    }
 
-	log.Printf("loading BPF from %s", path)
+    coll, err := ebpf.NewCollection(spec)
+    if err != nil {
+        return nil, nil, fmt.Errorf("new collection: %w", err)
+    }
 
-	spec, err := ebpf.LoadCollectionSpec(path)
-	if err != nil {
-		return nil, nil, fmt.Errorf("load spec: %w", err)
-	}
+    programs := []string{
+        "audit_lsm_bpf",
+        "audit_lsm_prog",
+        "audit_lsm_prog_free",
+    }
 
-	coll, err := ebpf.NewCollection(spec)
-	if err != nil {
-		return nil, nil, fmt.Errorf("new collection: %w", err)
-	}
+    var links []link.Link
 
-	lsmProg := coll.Programs["audit_lsm_prog"]
+    for _, name := range programs {
+        prog := coll.Programs[name]
+        if prog == nil {
+            coll.Close()
+            return nil, nil, fmt.Errorf("program not found: %s", name)
+        }
 
-	if lsmProg == nil {
-		coll.Close()
-		return nil, nil, fmt.Errorf("program not found")
-	}
+        l, err := link.AttachLSM(link.LSMOptions{Program: prog})
+        if err != nil {
+            coll.Close()
+            return nil, nil, fmt.Errorf("LSM attach failed for %s: %w", name, err)
+        }
 
-	lsmLink, err := link.AttachLSM(link.LSMOptions{Program: lsmProg})
-	if err != nil {
-		coll.Close()
-		return nil, nil, fmt.Errorf("LSM attach failed: %w", err)
-	}
+        links = append(links, l)
+        log.Printf("LSM attached: %s", name)
+    }
 
-	log.Println("LSM attached")
-
-	return coll, lsmLink, nil
+    return coll, links, nil
 }

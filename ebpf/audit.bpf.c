@@ -5,7 +5,9 @@
  * Single path calling bpfaudit_submit_event() kfunc
  * which lives in bpfledger.ko:
  *
- *   Path : LSM hook  lsm/bpf_prog_load    — synchronous, gets full prog info
+ *   LSM hook  lsm/bpf_prog    — synchronous, gets full prog info
+ *   LSM hook  lsm/bpf_prog_free - synchronous, gets full prog info 
+ *   LSM hook  lsm/bpf     check program PIN, ATTACH, DETTACH, UNPIN 
  *
  * The kfunc call is the ONLY write path into the kernel-side ring buffer
  * Userspace cannot write to /dev/bpfledger at all
@@ -22,19 +24,12 @@
 /*
  * kfunc exported by bpfledger.ko
  */
+
 extern void bpfaudit_submit_event(struct audit_record *rec,
                                   __u32 rec__sz, struct bpf_prog *prog) __ksym;
 
-/* ── BPF maps ──────────────────────────────────────────────────────────── */
-
-/* Cross-validation counters — read by userspace daemon to detect path mismatch
- */
-struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
-  __type(key, __u32);
-  __type(value, __u64);
-} lsm_counter SEC(".maps");
+extern void bpfaudit_submit_event_noprog(struct audit_record *rec,
+                                          __u32 rec__sz) __ksym;
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
@@ -51,14 +46,7 @@ static __always_inline void fill_process_ctx(struct audit_record *rec) {
   bpf_get_current_comm(rec->comm, sizeof(rec->comm));
 }
 
-static __always_inline void inc_counter(void *map) {
-  __u32 key = 0;
-  __u64 *val = bpf_map_lookup_elem(map, &key);
-  if (val)
-    __sync_fetch_and_add(val, 1);
-}
-
-/* ── LSM hook ──────────────────────────────────────────────────── */
+/* ── LSM bpf_prog hook ──────────────────────────────────────────────────── */
 
 /*
  * Fires synchronously when any BPF program passes the verifier and is about
@@ -66,7 +54,13 @@ static __always_inline void inc_counter(void *map) {
  * Returns 0... currently only audit no enforcement
  */
 SEC("lsm/bpf_prog")
-int BPF_PROG(audit_lsm_prog, struct bpf_prog *prog, struct bpf_prog_aux *aux) {
+int BPF_PROG(audit_lsm_prog, struct bpf_prog *prog) {
+
+  /* skip kernel threads — they have no mm */
+  if (bpf_get_current_task_btf()->mm == NULL)
+      return 0;
+
+
   struct audit_record rec = {};
 
   fill_process_ctx(&rec);
@@ -81,29 +75,80 @@ int BPF_PROG(audit_lsm_prog, struct bpf_prog *prog, struct bpf_prog_aux *aux) {
                      AUDIT_PROG_TAG_SIZE);
   }
 
-  inc_counter(&lsm_counter);
+  //inc_counter(&lsm_counter);
   bpfaudit_submit_event(&rec, sizeof(rec),prog);
 
   return 0; /* audit only */
 }
 
-/*SEC("lsm/bpf_prog_free")
-void BPF_PROG(audit_lsm_prog_free, struct bpf_prog *prog) {
-  struct audit_record rec = {};
 
-  if (!prog)
-    return;
 
-  fill_process_ctx(&rec);
+/* ── LSM bpf hook ──────────────────────────────────────────────────── */
+/*
+ * Fires synchronously on every bpf() syscall command.
+ * Filters PIN, GET, LINK_CREATE, LINK_DETACH only.
+ * Audit only — no enforcement.
+ */
+SEC("lsm/bpf")
+int BPF_PROG(audit_lsm_bpf, int cmd, union bpf_attr *attr, unsigned int size, bool kernel)
+{
+    if (kernel) 
+        return 0;
 
-  rec.event_type = AUDIT_EVENT_UNLOAD;
-  rec.source = AUDIT_SOURCE_LSM;
-  rec.prog_type = BPF_CORE_READ(prog, type);
-  rec.prog_id = BPF_CORE_READ(prog, aux, id);
-  __builtin_memcpy(rec.prog_tag, BPF_CORE_READ(prog, tag), AUDIT_PROG_TAG_SIZE);
+    struct audit_record rec = {};
 
-  inc_counter(&lsm_counter);
-  bpfaudit_submit_event(&rec, sizeof(rec));
-}*/
+    switch (cmd) {
+    case BPF_OBJ_PIN:
+        rec.event_type = AUDIT_EVENT_PIN;
+        break;
+    case BPF_OBJ_GET:
+        rec.event_type = AUDIT_EVENT_GET;
+        break;
+    case BPF_LINK_CREATE:
+        rec.event_type = AUDIT_EVENT_ATTACH;
+        break;
+    case BPF_LINK_DETACH:
+        rec.event_type = AUDIT_EVENT_DETACH;
+        break;
+    default:
+        return 0;   /* ignore everything else */
+    }
+
+    fill_process_ctx(&rec);
+    rec.source = AUDIT_SOURCE_LSM_BPF;
+
+    /* capture path for PIN/GET, prog_fd for ATTACH/DETACH */
+    if (attr) {
+        if (cmd == BPF_OBJ_PIN || cmd == BPF_OBJ_GET)
+            bpf_probe_read_user_str(rec.extra.path, sizeof(rec.extra.path),
+                        (void *)(unsigned long)attr->pathname);
+        else
+            rec.extra.prog_fd = (__u32)BPF_CORE_READ(attr, link_create.prog_fd);
+    }
+
+    bpfaudit_submit_event_noprog(&rec, sizeof(rec));
+    return 0;
+}
+
+
+
+/* ── LSM bpf_prog_free hook ──────────────────────────────────────────────────── */
+/* Fires synchronously before a BPF program is freed/unloaded*/
+SEC("lsm/bpf_prog_free")
+void BPF_PROG(audit_lsm_prog_free, struct bpf_prog *prog)
+{
+    /* skip kernel threads — they have no mm */
+    if (bpf_get_current_task_btf()->mm == NULL)
+        return;
+
+    struct audit_record rec = {};
+
+    fill_process_ctx(&rec);
+
+    rec.event_type = AUDIT_EVENT_FREE;
+    rec.source     = AUDIT_SOURCE_LSM_FREE;
+
+    bpfaudit_submit_event_noprog(&rec, sizeof(rec));
+}
 
 char LICENSE[] SEC("license") = "GPL";

@@ -11,11 +11,19 @@
 #include <linux/types.h>
 #endif
 /* Event sources */
-#define AUDIT_SOURCE_LSM 0 /* Came from BPF LSM hook     */
+#define AUDIT_SOURCE_LSM 0 
+#define AUDIT_SOURCE_LSM_FREE 1
+#define AUDIT_SOURCE_LSM_BPF  2 
+
+
 
 /* Event types */
-#define AUDIT_EVENT_LOAD 1
-#define AUDIT_EVENT_UNLOAD 2
+#define AUDIT_EVENT_LOAD    0  
+#define AUDIT_EVENT_FREE    1
+#define AUDIT_EVENT_PIN     2
+#define AUDIT_EVENT_GET     3
+#define AUDIT_EVENT_ATTACH  4
+#define AUDIT_EVENT_DETACH  5
 
 #define AUDIT_PROG_TAG_SIZE 8
 #define AUDIT_COMM_SIZE 16
@@ -46,8 +54,10 @@ struct audit_record {
   __u8 prog_tag[AUDIT_PROG_TAG_SIZE];
   char comm[AUDIT_COMM_SIZE];
   __u8 bytecode_hash[32];
-
-  __u8 __pad[6]; 
+  union {
+    char path[64]; 
+    __u32 prog_fd ; 
+  }extra; 
 };
 
 #define AUDIT_RECORD_SIZE sizeof(struct audit_record)

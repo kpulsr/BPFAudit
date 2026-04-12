@@ -18,7 +18,7 @@
 #include <linux/spinlock.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
-#include <crypto/blake2s.h>
+#include <crypto/blake2b.h>
 
 #include "bpfledger.h"
 
@@ -83,13 +83,16 @@ static void prog_hash(struct audit_record *ar, struct bpf_prog *prog)
 
     blake2b(NULL, 0,
             (u8 *)prog->insnsi, size,
-            ar->bytecode_hash, BLAKE2S_HASH_SIZE);
+            ar->bytecode_hash, 32);
 }
 
 /* ───────────────────────────── kfunc ────────────────────────────────────── */
 
 __bpf_kfunc void bpfaudit_submit_event(struct audit_record *rec, __u32 rec__sz,
                                        struct bpf_prog *prog);
+
+__bpf_kfunc void bpfaudit_submit_event_noprog(struct audit_record *rec, __u32 rec__sz); 
+
 
 __bpf_kfunc void bpfaudit_submit_event(struct audit_record *rec, __u32 rec__sz,
                                        struct bpf_prog *prog) {
@@ -121,10 +124,18 @@ __bpf_kfunc void bpfaudit_submit_event(struct audit_record *rec, __u32 rec__sz,
 
   wake_up_interruptible(&ring_wq);
 }
+
+__bpf_kfunc void bpfaudit_submit_event_noprog(struct audit_record *rec, __u32 rec__sz)
+{
+    bpfaudit_submit_event(rec, rec__sz, NULL);
+}
+
 EXPORT_SYMBOL_GPL(bpfaudit_submit_event);
+EXPORT_SYMBOL_GPL(bpfaudit_submit_event_noprog);
 
 BTF_KFUNCS_START(bpfaudit_kfunc_ids)
 BTF_ID_FLAGS(func, bpfaudit_submit_event, KF_TRUSTED_ARGS)
+BTF_ID_FLAGS(func, bpfaudit_submit_event_noprog, KF_TRUSTED_ARGS)
 BTF_KFUNCS_END(bpfaudit_kfunc_ids)
 
 static const struct btf_kfunc_id_set bpfaudit_lsm_kfunc_set = {
