@@ -30,8 +30,8 @@ struct audit_record {
 	/* Filled by kernel module (ledger side) */
 	__u64 seq;                          /* monotonic counter, set in module  */
 	__u64 timestamp_ns;                 /* ktime_get_ns(), set in module     */
-	__u8  prev_hash[32];                /* SHA-256 of previous record        */
-	__u8  curr_hash[32];                /* SHA-256 of this record            */
+	__u64 prev_hash;                /* 8 Bytes hash          */
+	__u64 curr_hash;                /* 8 Bytes hash          */
 
 	/* Filled by BPF program (hook side) */
 	__u32 pid;
@@ -47,7 +47,7 @@ struct audit_record {
 	char  comm[AUDIT_COMM_SIZE];
 
 	/* Padding to 128-byte cache-line multiple */
-	__u8  __pad[2];
+	__u8  __pad[32];
 };
 
 #define AUDIT_RECORD_SIZE sizeof(struct audit_record)

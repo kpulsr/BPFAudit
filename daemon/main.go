@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -16,8 +15,8 @@ import (
 type AuditRecord struct {
 	Seq         uint64
 	TimestampNs uint64
-	PrevHash    [32]byte
-	CurrHash    [32]byte
+	PrevHash    uint64
+	CurrHash    uint64
 	Pid         uint32
 	Tgid        uint32
 	Uid         uint32
@@ -29,7 +28,7 @@ type AuditRecord struct {
 	Source      uint8
 	ProgTag     [8]byte
 	Comm        [16]byte
-	Pad         [2]byte
+	Pad         [32]byte
 }
 
 type Config struct {
@@ -80,7 +79,7 @@ func main() {
 func RunReader(dev *os.File, readCounter func() (uint64), eventLog *os.File) {
 	log.Println("device open, reading events...")
 
-	buf := make([]byte, 144)
+	buf := make([]byte, 128)
 
 	for {
 		_, err := dev.Read(buf)
@@ -97,14 +96,14 @@ func RunReader(dev *os.File, readCounter func() (uint64), eventLog *os.File) {
 		lsm := readCounter()
 
 		line := fmt.Sprintf(
-			"seq=%-4d pid=%-6d uid=%-6d comm=%-16s event=%d source=%d hash=%s | lsm=%-4d \n",
+			"seq=%-4d pid=%-6d uid=%-6d comm=%-16s event=%d source=%d hash=%016x | lsm=%-4d \n",
 			rec.Seq,
 			rec.Pid,
 			rec.Uid,
 			string(bytes.TrimRight(rec.Comm[:], "\x00")),
 			rec.EventType,
 			rec.Source,
-			hex.EncodeToString(rec.CurrHash[:8]),
+			rec.CurrHash,
 			lsm,
 		)
 

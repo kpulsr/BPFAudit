@@ -14,6 +14,7 @@
 #include <linux/poll.h>
 #include <linux/ktime.h>
 #include <linux/crc32c.h>
+#include <linux/siphash.h>
 #include <linux/btf.h>
 #include <linux/btf_ids.h>
 
@@ -34,27 +35,36 @@ static u64                  ring_head;   /* next write slot, ever-increasing */
 static DEFINE_SPINLOCK(ring_lock);
 static DECLARE_WAIT_QUEUE_HEAD(ring_wq);
 
-static u8 g_prev_hash[32];   /* protected by ring_lock */
+static u64 g_prev_hash;   /* protected by ring_lock */
+static siphash_key_t g_siphash_key;  /* hashing key */
 
-static void chain_hash(struct audit_record *rec)
-{
-	u32 crc;
-	int i;
+/* ───────────────────────────── SipHashing  ──────────────────────────────── */
 
-	memcpy(rec->prev_hash, g_prev_hash, 32);
+static void chain_hash(struct audit_record *rec) {
 
-	crc = crc32c(~0U, g_prev_hash,        32);
-	crc = crc32c(crc, &rec->seq,          sizeof(rec->seq));
-	crc = crc32c(crc, &rec->timestamp_ns, sizeof(rec->timestamp_ns));
-	crc = crc32c(crc, &rec->pid,          sizeof(rec->pid));
-	crc = crc32c(crc, rec->prog_tag,      AUDIT_PROG_TAG_SIZE);
+    struct {
+        u64 prev; 
+        u64 seq; 
+        u64 ts; 
+        u32 pid; 
+        u8 tag[AUDIT_PROG_TAG_SIZE]; 
+    }input; 
+    u64 h; 
+    
+    rec->prev_hash = g_prev_hash;
 
-	for (i = 0; i < 32; i++)
-		rec->curr_hash[i] = ((crc >> ((i % 4) * 8)) & 0xff)
-		                    ^ g_prev_hash[i] ^ (u8)i;
+    input.prev = g_prev_hash;
+    input.seq  = rec->seq;
+    input.ts   = rec->timestamp_ns;
+    input.pid  = rec->pid;
+    memcpy(input.tag, rec->prog_tag, AUDIT_PROG_TAG_SIZE);
 
-	memcpy(g_prev_hash, rec->curr_hash, 32);
+    h = siphash(&input, sizeof(input), &g_siphash_key);
+
+    rec->curr_hash = h;
+    g_prev_hash    = h;
 }
+
 
 /* ───────────────────────────── kfunc ────────────────────────────────────── */
 
@@ -287,9 +297,11 @@ static int __init bpfledger_init(void)
 {
 	int ret;
 
+    get_random_bytes(&g_siphash_key, sizeof(g_siphash_key));
+
 	memset(ring, 0, sizeof(ring));
 	ring_head = 0;
-	memset(g_prev_hash, 0, sizeof(g_prev_hash));
+	g_prev_hash = 0;
 
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_LSM, &bpfaudit_lsm_kfunc_set);
 	if (ret) {
