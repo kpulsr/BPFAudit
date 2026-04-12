@@ -32,79 +32,56 @@ type AuditRecord struct {
 	Pad         [2]byte
 }
 
+type Config struct {
+	BPF struct {
+		LSM     link.Link
+		BPFPATH *string
+	}
+
+	Logs struct {
+		Event *os.File
+		Alert *os.File
+	}
+
+	Device *os.File
+}
+
 func main() {
-	ebpfPath := flag.String("ebpf",   "../ebpf/audit.bpf.o", "path to eBPF object file")
-	devPath  := flag.String("device", "/dev/bpfledger",       "ledger device node")
-	flag.Parse()
+	cfg, err := ParseFlags()
+	if err != nil {
+		log.Fatalf("parsing flags: %v", err)
+	}
 
-	// 1. Load BPF
-	log.Printf("loading BPF from %s", *ebpfPath)
-	spec, err := ebpf.LoadCollectionSpec(*ebpfPath)
+	coll, lsmLink, err := LoadBPF(&cfg)
 	if err != nil {
-		log.Fatalf("load spec: %v", err)
+		log.Fatalf("load BPF: %v", err)
 	}
-	coll, err := ebpf.NewCollection(spec)
-	if err != nil {
-		log.Fatalf("new collection: %v", err)
-	}
+
+	cfg.BPF.LSM = lsmLink
+
 	defer coll.Close()
-	log.Println("BPF loaded")
+	defer cfg.Close()
 
-	// 2. Attach both at the same time
-	lsmProg    := coll.Programs["audit_lsm_prog_load"]
-	kprobeProg := coll.Programs["audit_kprobe_prog_load"]
+	lsmMap := coll.Maps["lsm_counter"]
+	key := uint32(0)
 
-	if lsmProg == nil || kprobeProg == nil {
-		log.Fatalf("programs not found in object: lsm=%v kprobe=%v", lsmProg, kprobeProg)
-	}
-
-	lsmLink, err := link.AttachLSM(link.LSMOptions{Program: lsmProg})
-	if err != nil {
-		log.Fatalf("LSM attach failed: %v", err)
-	}
-	defer lsmLink.Close()
-
-	kprobeLink, err := link.Kprobe("bpf_prog_load", kprobeProg, nil)
-	if err != nil {
-		log.Fatalf("kprobe attach failed: %v", err)
-	}
-	defer kprobeLink.Close()
-
-	log.Println("LSM and kprobe attached")
-
-	lsmMap    := coll.Maps["lsm_counter"]
-	kprobeMap := coll.Maps["kprobe_counter"]
-	key       := uint32(0)
-
-	// Reset both counters — LSM fired for the kprobe attach itself, start clean
-	zero := uint64(0)
-	if lsmMap != nil    { lsmMap.Update(&key, &zero, ebpf.UpdateAny) }
-	if kprobeMap != nil { kprobeMap.Update(&key, &zero, ebpf.UpdateAny) }
-
-	readCounters := func() (lsm, kprobe uint64) {
+	readCounter := func() (lsm uint64) {
 		if lsmMap != nil {
 			lsmMap.Lookup(&key, &lsm)
-		}
-		if kprobeMap != nil {
-			kprobeMap.Lookup(&key, &kprobe)
 		}
 		return
 	}
 
-	lsm, kprobe := readCounters()
-	log.Printf("counters after attach: lsm=%d kprobe=%d", lsm, kprobe)
+	RunReader(cfg.Device, readCounter, cfg.Logs.Event)
+}
 
-	// 3. Open device
-	log.Printf("opening %s", *devPath)
-	dev, err := os.Open(*devPath)
-	if err != nil {
-		log.Fatalf("open device: %v", err)
-	}
-	defer dev.Close()
+// ---------------- Reader ----------------
+
+func RunReader(dev *os.File, readCounter func() (uint64), eventLog *os.File) {
 	log.Println("device open, reading events...")
 
-	// 4. Read and print events
 	buf := make([]byte, 144)
+
 	for {
 		_, err := dev.Read(buf)
 		if err != nil {
@@ -117,8 +94,10 @@ func main() {
 			continue
 		}
 
-		lsm, kprobe := readCounters()
-		fmt.Printf("seq=%-4d pid=%-6d uid=%-6d comm=%-16s event=%d source=%d hash=%s | lsm=%-4d kprobe=%-4d\n",
+		lsm := readCounter()
+
+		line := fmt.Sprintf(
+			"seq=%-4d pid=%-6d uid=%-6d comm=%-16s event=%d source=%d hash=%s | lsm=%-4d \n",
 			rec.Seq,
 			rec.Pid,
 			rec.Uid,
@@ -127,7 +106,105 @@ func main() {
 			rec.Source,
 			hex.EncodeToString(rec.CurrHash[:8]),
 			lsm,
-			kprobe,
 		)
+
+		// stdout
+		fmt.Print(line)
+
+		// file
+		if eventLog != nil {
+			if _, err := eventLog.WriteString(line); err != nil {
+				log.Printf("log write failed: %v", err)
+			}
+		}
 	}
+}
+
+// ---------------- Config ----------------
+
+func ParseFlags() (Config, error) {
+	var cfg Config
+
+	ebpfPath := flag.String("ebpf", "../ebpf/audit.bpf.o", "path to eBPF object file")
+	devPath := flag.String("device", "/dev/bpfledger", "ledger device node")
+	eventLogPath := flag.String("eventLog", "/var/log/bpfaudit/event.log", "bpf events log")
+	alertLogPath := flag.String("alertLog", "/var/log/bpfaudit/alert.log", "bpf alerts log")
+
+	flag.Parse()
+
+	dev, err := os.Open(*devPath)
+	if err != nil {
+		return cfg, fmt.Errorf("open device: %w", err)
+	}
+	cfg.Device = dev
+
+	eventLog, err := os.OpenFile(*eventLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		dev.Close()
+		return cfg, fmt.Errorf("open event log: %w", err)
+	}
+
+	alertLog, err := os.OpenFile(*alertLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		eventLog.Close()
+		dev.Close()
+		return cfg, fmt.Errorf("open alert log: %w", err)
+	}
+
+	cfg.Logs.Event = eventLog
+	cfg.Logs.Alert = alertLog
+	cfg.BPF.BPFPATH = ebpfPath
+
+	return cfg, nil
+}
+
+func (c *Config) Close() {
+	if c.BPF.LSM != nil {
+		c.BPF.LSM.Close()
+	}
+	if c.Logs.Event != nil {
+		c.Logs.Event.Close()
+	}
+	if c.Logs.Alert != nil {
+		c.Logs.Alert.Close()
+	}
+	if c.Device != nil {
+		c.Device.Close()
+	}
+}
+
+// ---------------- BPF ----------------
+
+func LoadBPF(cfg *Config) (*ebpf.Collection, link.Link, error) {
+
+	path := *cfg.BPF.BPFPATH
+
+	log.Printf("loading BPF from %s", path)
+
+	spec, err := ebpf.LoadCollectionSpec(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load spec: %w", err)
+	}
+
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return nil, nil, fmt.Errorf("new collection: %w", err)
+	}
+
+	lsmProg := coll.Programs["audit_lsm_prog_load"]
+
+	if lsmProg == nil {
+		coll.Close()
+		return nil, nil, fmt.Errorf("program not found")
+	}
+
+	lsmLink, err := link.AttachLSM(link.LSMOptions{Program: lsmProg})
+	if err != nil {
+		coll.Close()
+		return nil, nil, fmt.Errorf("LSM attach failed: %w", err)
+	}
+
+	log.Println("LSM attached")
+
+	return coll, lsmLink, nil
 }
