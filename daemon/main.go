@@ -2,228 +2,100 @@ package main
 
 import (
 	"bytes"
-	"unsafe"
 	"encoding/binary"
-	"flag"
-	"fmt"
 	"log"
 	"os"
-    "encoding/hex"
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
+	"os/signal"
+	"syscall"
 )
 
+// 208 Bytes Exact ABI Mapping
+// record of the actuall current action
+// ... could be {INTENT,LOAD,ATTACH,DETTACH,FREE,PIN}
 type AuditRecord struct {
-    Seq          uint64
-    TimestampNs  uint64
-    PrevHash     uint64
-    CurrHash     uint64
-    Pid          uint32
-    Tgid         uint32
-    Uid          uint32
-    Gid          uint32
-    CgroupId     uint64
-    ProgId       uint32
-    ProgType     uint32
-    EventType    uint8
-    Source       uint8
-    ProgTag      [8]byte
-    Comm         [16]byte
-    BytecodeHash [32]byte
-	Extra        [64]byte
-	Pad          [6]byte 
-}
-
-type Config struct {
-	BPF struct {
-		LSM     []link.Link
-		BPFPATH *string
-	}
-
-	Logs struct {
-		Event *os.File
-		Alert *os.File
-	}
-
-	Device *os.File
-}
-
-
-func init() {
-    if unsafe.Sizeof(AuditRecord{}) != 192 {
-        panic(fmt.Sprintf("AuditRecord size mismatch: %d", unsafe.Sizeof(AuditRecord{})))
-    }
+	Seq          uint64
+	TimestampNs  uint64
+	PrevHash     uint64
+	CurrHash     uint64
+	Pid          uint32
+	Tgid         uint32
+	Uid          uint32
+	Gid          uint32
+	CgroupId     uint64
+	ReservedPad  uint64
+	PidNsId      uint64
+	ProgId       uint32
+	ProgType     uint32
+	EventType    uint8
+	Source       uint8
+	Pad          [6]byte
+	ProgTag      [8]byte
+	Comm         [16]byte
+	BytecodeHash [32]byte
+	Extra        [64]byte // union of data {prog_fd or path for pin event or raw data}
 }
 
 func main() {
-	cfg, err := ParseFlags()
+	os.MkdirAll("/var/log/bpfaudit", 0755)
+	ledgerLog, _ := os.OpenFile("/var/log/bpfaudit/ledger.json", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	alertLog, _ := os.OpenFile("/var/log/bpfaudit/alerts.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+
+	defer ledgerLog.Close()
+	defer alertLog.Close()
+
+	dev, err := os.Open("/dev/bpfaudit")
 	if err != nil {
-		log.Fatalf("parsing flags: %v", err)
+		log.Fatalf("Failed to open /dev/bpfaudit: %v", err)
 	}
 
-	coll, links , err := LoadBPF(&cfg)
-	if err != nil {
-		log.Fatalf("load BPF: %v", err)
-	}
+	analyzer := NewAnalyzer("/var/lib/bpfaudit/baseline.db", ledgerLog, alertLog)
 
-	cfg.BPF.LSM = links
+	// graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sigCh
+		log.Println("Shutting down")
+		dev.Close()
+		os.Exit(0)
+	}()
 
-	defer coll.Close()
-	defer cfg.Close()
-
-
-	RunReader(cfg.Device, cfg.Logs.Event)
+	/**
+	 * Reader fuction is a function responsible for infit loop read syscall
+	 * on a device character created by the LLKM
+	 * it does :
+	 * 		1. verify chain hash if broken, catching any possible tampering
+	 * 		2. run an analyzer which will analyse the output BPF events
+	 * 			and BPF programs lifecycle, looking for any suspecious action
+	 * 			& logging it into an append only ledger
+	 */
+	RunReader(dev, analyzer)
 }
 
-// ---------------- Reader ----------------
-
-func RunReader(dev *os.File, eventLog *os.File) {
-	log.Println("device open, reading events...")
-
-	buf := make([]byte, 192)
+func RunReader(dev *os.File, analyzer *Analyzer) {
+	buf := make([]byte, 208)
+	var chainPrevHash uint64 = 0 // SipHash
 
 	for {
 		_, err := dev.Read(buf)
 		if err != nil {
-			log.Fatalf("read: %v", err)
+			// future polling implementation (exists in the char dev fd file_operations)
+			if err.Error() == "EAGAIN" || err.Error() == "EINTR" || err.Error() == "EOVERFLOW" {
+				continue
+			}
+			log.Fatalf("Fatal device read error: %v", err)
 		}
 
 		var rec AuditRecord
-		if err := binary.Read(bytes.NewReader(buf), binary.LittleEndian, &rec); err != nil {
-			log.Printf("parse: %v", err)
-			continue
+		binary.Read(bytes.NewReader(buf), binary.LittleEndian, &rec)
+
+		chainBroken := (rec.Seq > 0 && rec.PrevHash != chainPrevHash)
+		if chainBroken {
+			// TODO: log to an alert file  or SIEM interface
+			log.Printf("[CRITICAL] CHAIN BREAK seq=%d! Exp=0x%016x Got=0x%016x", rec.Seq, chainPrevHash, rec.PrevHash)
 		}
+		chainPrevHash = rec.CurrHash
 
-        extraStr := ""
-		switch rec.EventType {
-			case 2, 3: // PIN, GET
-    			extraStr = fmt.Sprintf("path=%s",
-        		string(bytes.TrimRight(rec.Extra[:], "\x00")))
-			case 4, 5: // ATTACH, DETACH
-    			progFd := binary.LittleEndian.Uint32(rec.Extra[:4])
-    			extraStr = fmt.Sprintf("prog_fd=%d", progFd)
-		}
-
-		line := fmt.Sprintf(
-			"seq=%-4d pid=%-6d uid=%-6d comm=%-16s event=%d source=%d hash=%016x blake2b=%s %s \n",
-			rec.Seq,
-			rec.Pid,
-			rec.Uid,
-			string(bytes.TrimRight(rec.Comm[:], "\x00")),
-			rec.EventType,
-			rec.Source,
-			rec.CurrHash,
-			hex.EncodeToString(rec.BytecodeHash[:]),
-			extraStr, 
-		)
-
-		// stdout
-		fmt.Print(line)
-
-		// file
-		if eventLog != nil {
-			if _, err := eventLog.WriteString(line); err != nil {
-				log.Printf("log write failed: %v", err)
-			}
-		}
+		analyzer.ProcessEvent(&rec, chainBroken)
 	}
-}
-
-// ---------------- Config ----------------
-
-func ParseFlags() (Config, error) {
-	var cfg Config
-
-	ebpfPath := flag.String("ebpf", "../ebpf/audit.bpf.o", "path to eBPF object file")
-	devPath := flag.String("device", "/dev/bpfledger", "ledger device node")
-	eventLogPath := flag.String("eventLog", "/var/log/bpfaudit/event.log", "bpf events log")
-	alertLogPath := flag.String("alertLog", "/var/log/bpfaudit/alert.log", "bpf alerts log")
-
-	flag.Parse()
-
-	dev, err := os.Open(*devPath)
-	if err != nil {
-		return cfg, fmt.Errorf("open device: %w", err)
-	}
-	cfg.Device = dev
-
-	eventLog, err := os.OpenFile(*eventLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		dev.Close()
-		return cfg, fmt.Errorf("open event log: %w", err)
-	}
-
-	alertLog, err := os.OpenFile(*alertLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		eventLog.Close()
-		dev.Close()
-		return cfg, fmt.Errorf("open alert log: %w", err)
-	}
-
-	cfg.Logs.Event = eventLog
-	cfg.Logs.Alert = alertLog
-	cfg.BPF.BPFPATH = ebpfPath
-
-	return cfg, nil
-}
-
-func (c *Config) Close() {
-    for _, l := range c.BPF.LSM {
-        if l != nil {
-            l.Close()
-        }
-    }
-    if c.Logs.Event != nil {
-        c.Logs.Event.Close()
-    }
-    if c.Logs.Alert != nil {
-        c.Logs.Alert.Close()
-    }
-    if c.Device != nil {
-        c.Device.Close()
-    }
-}
-
-// ---------------- BPF ----------------
-
-func LoadBPF(cfg *Config) (*ebpf.Collection, []link.Link , error) {
-    path := *cfg.BPF.BPFPATH
-    log.Printf("loading BPF from %s", path)
-
-    spec, err := ebpf.LoadCollectionSpec(path)
-    if err != nil {
-        return nil, nil, fmt.Errorf("load spec: %w", err)
-    }
-
-    coll, err := ebpf.NewCollection(spec)
-    if err != nil {
-        return nil, nil, fmt.Errorf("new collection: %w", err)
-    }
-
-    programs := []string{
-        "audit_lsm_bpf",
-        "audit_lsm_prog",
-        "audit_lsm_prog_free",
-    }
-
-    var links []link.Link
-
-    for _, name := range programs {
-        prog := coll.Programs[name]
-        if prog == nil {
-            coll.Close()
-            return nil, nil, fmt.Errorf("program not found: %s", name)
-        }
-
-        l, err := link.AttachLSM(link.LSMOptions{Program: prog})
-        if err != nil {
-            coll.Close()
-            return nil, nil, fmt.Errorf("LSM attach failed for %s: %w", name, err)
-        }
-
-        links = append(links, l)
-        log.Printf("LSM attached: %s", name)
-    }
-
-    return coll, links, nil
 }
