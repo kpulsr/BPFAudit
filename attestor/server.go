@@ -2,10 +2,15 @@
 package main
 
 import (
+	"crypto"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,6 +18,19 @@ import (
 	"sync"
 	"time"
 )
+
+
+
+var tpmPubKey *rsa.PublicKey
+
+func init() {
+	b, _ := os.ReadFile("pubkey.pem")
+	block, _ := pem.Decode(b)
+	pub, _ := x509.ParsePKIXPublicKey(block.Bytes)
+	tpmPubKey = pub.(*rsa.PublicKey)
+}
+
+
 
 const (
 	LISTEN             = ":9000"
@@ -44,6 +62,7 @@ type WireRecord struct {
 type Batch struct {
 	IsHeartbeat bool         `json:"is_heartbeat"`
 	KernelHash  string       `json:"kernel_hash,omitempty"`
+	Signature   string       `json:"signature,omitempty"`
 	Records     []WireRecord `json:"records"`
 }
 
@@ -59,6 +78,7 @@ type LedgerEntry struct {
 	KernelHash             string       `json:"kernel_hash,omitempty"`
 	Recomputed             string       `json:"recomputed,omitempty"`
 	HashOK                 bool         `json:"hash_ok,omitempty"`
+	SigOK                  bool         `json:"sig_ok,omitempty"`
 }
 
 type Attestor struct {
@@ -238,6 +258,33 @@ func (a *Attestor) verify(batch Batch, now time.Time) LedgerEntry {
 		}
 	}
 
+	// ── TPM SIGNATURE VERIFICATION ── 
+	if batch.Signature != "" {
+		sigBytes, err := base64.StdEncoding.DecodeString(batch.Signature)
+		hashBytes, _ := hex.DecodeString(batch.KernelHash)
+		if err != nil || len(hashBytes) != 32 {
+			entry.SigOK = false
+			entry.OK = false
+			entry.Errors = append(entry.Errors, "sig/hash decode fail")
+			a.alert("sig/hash decode fail")
+		} else {
+			err = rsa.VerifyPKCS1v15(tpmPubKey, crypto.SHA256, hashBytes, sigBytes)
+			if err != nil {
+				entry.SigOK = false
+				entry.OK = false
+				entry.Errors = append(entry.Errors, "SIGNATURE INVALID")
+				a.alert("SIGNATURE INVALID")
+			} else {
+				entry.SigOK = true
+			}
+		}
+	} else {
+		entry.SigOK = false
+		entry.OK = false
+		entry.Errors = append(entry.Errors, "missing TPM signature")
+		a.alert("missing TPM signature")
+	}
+
 	return entry
 }
 
@@ -265,9 +312,9 @@ func (a *Attestor) handle(w http.ResponseWriter, r *http.Request) {
 	if !entry.OK {
 		status = "FAIL"
 	}
-	log.Printf("[ATTESTOR] batch hb=%v seqs=%d..%d hb_age=%.1fs hash_ok=%v → %s",
+	log.Printf("[ATTESTOR] batch hb=%v seqs=%d..%d hb_age=%.1fs hash_ok=%v sig_ok=%v → %s",
 		batch.IsHeartbeat, entry.BatchSeqStart, entry.BatchSeqEnd,
-		entry.SecsSinceLastHeartbeat, entry.HashOK, status)
+		entry.SecsSinceLastHeartbeat, entry.HashOK, entry.SigOK,status)
 
 	w.WriteHeader(http.StatusOK)
 }

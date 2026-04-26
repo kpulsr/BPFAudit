@@ -11,6 +11,9 @@ import (
 	"os"
 	"strings"
 	"time"
+	"os/exec"
+	"encoding/base64"
+	"encoding/hex"
 )
 
 const (
@@ -66,7 +69,38 @@ type WireRecord struct {
 type Batch struct {
 	IsHeartbeat bool         `json:"is_heartbeat"`
 	KernelHash  string       `json:"kernel_hash,omitempty"`
+	Signature   string       `json:"signature,omitempty"`
 	Records     []WireRecord `json:"records"`
+}
+
+
+// Sign the hex hash with TPM persistent key 0x81000003
+func tpmsign(hexHash string) string {
+	if hexHash == "" {
+		return ""
+	}
+	hashBytes, err := hex.DecodeString(hexHash)
+	if err != nil || len(hashBytes) != 32 {
+		return ""
+	}
+
+	// write raw 32-byte digest
+	os.WriteFile("/tmp/bpfaudit_hash.bin", hashBytes, 0600)
+
+	cmd := exec.Command("tpm2_sign", "-c", "0x81000003", "-g", "sha256", "-d",
+		"-o", "/tmp/bpfaudit_sig.bin", "/tmp/bpfaudit_hash.bin")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("[DAEMON] tpm2_sign failed: %v %s", err, out)
+		return ""
+	}
+
+	sig, err := os.ReadFile("/tmp/bpfaudit_sig.bin")
+	if err != nil || len(sig) <= 6 {
+		return ""
+	}
+
+	// skip 6-byte TPM header (alg 2 + hash 2 + len 2)
+	return base64.StdEncoding.EncodeToString(sig[6:])
 }
 
 func getKernelHash() string {
@@ -174,7 +208,8 @@ func main() {
 
 		if count == BATCH_MAX {
 			kernelHash := getKernelHash()
-			toSend := Batch{IsHeartbeat: false, KernelHash: kernelHash, Records: make([]WireRecord, count)}
+			sig := tpmsign(kernelHash)
+			toSend := Batch{IsHeartbeat: false, KernelHash: kernelHash,Signature: sig ,Records: make([]WireRecord, count)}
 			copy(toSend.Records, buf[:count])
 			count = 0
 			send(toSend)
