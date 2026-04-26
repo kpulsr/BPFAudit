@@ -32,6 +32,7 @@
 #define AUDIT_PROG_TAG_SIZE 8
 #define AUDIT_COMM_SIZE 16
 
+
 /*
  * audit_record - one eBPF lifecycle event
  *
@@ -50,7 +51,6 @@ struct audit_record {
   u32 gid;
 
   u64 cgroup_id;
-  u64 reserved_pad;
   u64 pid_ns_id;
 
   u32 prog_id;
@@ -58,18 +58,13 @@ struct audit_record {
 
   u8 event_type;
   u8 source;
-  u8 pad[6];
+  u8  _pad[6];
 
   u8 prog_tag[8];
   char comm[16];
-  u8 bytecode_hash[32];
 
-  union {
-    char path[64];
-    u32 prog_fd;
-    u8 raw[64];
-  } extra;
-};
+  char path[64];
+}__attribute__((packed)); 
 
 #define AUDIT_RECORD_SIZE sizeof(struct audit_record)
 

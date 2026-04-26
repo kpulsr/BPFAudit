@@ -2,22 +2,30 @@ KDIR    ?= /lib/modules/$(shell uname -r)/build
 PWD     := $(shell pwd)
 CLANG   ?= clang
 ARCH    := $(shell uname -m | sed 's/x86_64/x86/')
+BUILD   := $(PWD)/build
+
+# Include headers
+ccflags-y += -I$(src)/include
 
 # Kernel module
 obj-m := bpfledger.o
+bpfledger-y := src/bpfledger_main.o src/bpfaudit_emit.o
+
 
 all: module
 
 module:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	mkdir -p $(BUILD)
+	$(MAKE) -C $(KDIR) M=$(PWD) MO=$(BUILD) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) M=$(PWD) MO=$(BUILD) clean
+	rm -rf $(BUILD)
 
 # Load / unload helpers
 load:
-	sudo insmod bpfledger.ko
-	@echo "Ledger module loaded. /dev/bpfledger is ready."
+	sudo insmod $(BUILD)/bpfledger.ko
+	@echo "Ledger module loaded."
 
 unload:
 	sudo rmmod bpfledger

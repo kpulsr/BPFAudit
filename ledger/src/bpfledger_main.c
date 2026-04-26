@@ -6,6 +6,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "bpfledger.h"
+#include "bpfaudit_emit.h"
 #include <linux/bpf.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
@@ -25,15 +26,19 @@
 #include <linux/spinlock.h>
 #include <linux/uidgid.h>
 #include <linux/wait.h>
+#include <linux/cgroup.h>
+#include <linux/sysfs.h>
+
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Meriah Ibrahim Abderrahim");
-MODULE_DESCRIPTION("V6 Native BPF Ledger (Cryptographic, Container-Aware)");
+MODULE_DESCRIPTION("Native BPF Ledger (Cryptographic, Container-Aware)");
 MODULE_VERSION("6.0-FINAL");
 
 /* --------------------------- Ring Buffer -------------------------*/
-#define RING_SIZE 4096
+#define RING_SIZE 65536
 #define RING_MASK (RING_SIZE - 1)
+#define BATCH_SIZE 32
 
 /* --------------------------- Global Variables ----------------------------*/
 static struct audit_record ring[RING_SIZE];
@@ -43,8 +48,41 @@ static siphash_key_t siphash_key;
 
 static DEFINE_SPINLOCK(ring_lock);
 static DECLARE_WAIT_QUEUE_HEAD(ring_wq);
+static struct audit_record tpm_batch[BATCH_SIZE];
+static unsigned int tpm_batch_count = 0;
 
+
+static struct audit_record hb_slot;
+static atomic_t hb_avail = ATOMIC_INIT(0);
+static struct bpf_ring_ctx hb_ctx = { &hb_slot, &hb_avail, &ring_wq};
+extern u8 last_batch_hash[32];
+static struct device *bpfaudit_dev;
+
+
+#define HASH_FIFO_SIZE 64
+#define HASH_FIFO_MASK (HASH_FIFO_SIZE - 1)
+
+static u8        hash_fifo[HASH_FIFO_SIZE][32];
+static unsigned  hash_fifo_head = 0;   /* next write slot */
+static unsigned  hash_fifo_tail = 0;   /* next read  slot */
+static DEFINE_SPINLOCK(hash_fifo_lock);
 /* ----------------------------- Helpers -----------------------------------*/
+
+static ssize_t batch_hash_show(struct device *dev,
+                               struct device_attribute *attr, char *buf)
+{
+    u8 hash[32];
+    spin_lock(&hash_fifo_lock);
+    if (hash_fifo_head == hash_fifo_tail) {
+        spin_unlock(&hash_fifo_lock);
+        return sprintf(buf, "\n");   /* empty — daemon will retry */
+    }
+    memcpy(hash, hash_fifo[hash_fifo_tail & HASH_FIFO_MASK], 32);
+    hash_fifo_tail++;
+    spin_unlock(&hash_fifo_lock);
+    return sprintf(buf, "%*phN\n", 32, hash);
+}
+static DEVICE_ATTR(batch_hash, 0444, batch_hash_show, NULL);
 
 /**
  * extract all possible data of the current process
@@ -52,15 +90,21 @@ static DECLARE_WAIT_QUEUE_HEAD(ring_wq);
  * namespace is for containers env
  */
 static void fill_process_ctx(struct audit_record *rec) {
+  struct css_set *css; 
+
   rec->pid = (u32)current->pid;
   rec->tgid = (u32)current->tgid;
   rec->uid = from_kuid(&init_user_ns, current_uid());
   rec->gid = from_kgid(&init_user_ns, current_gid());
-  rec->cgroup_id = 0;
-  rec->reserved_pad = 0;
 
   if (task_active_pid_ns(current))
     rec->pid_ns_id = task_active_pid_ns(current)->ns.inum;
+
+  css = task_css_set(current);
+  if (css && css->dfl_cgrp)
+      rec->cgroup_id = (u64)cgroup_ino(css->dfl_cgrp); 
+  else
+      rec->cgroup_id = 0; 
 }
 
 /**
@@ -72,7 +116,10 @@ static void native_submit_event(struct audit_record *rec) {
   unsigned long flags;
   u64 seq;
 
+  struct audit_record flush_batch[BATCH_SIZE];
+
   spin_lock_irqsave(&ring_lock, flags);
+  bool do_flush = false; 	
 
   seq = ring_head++;
   rec->seq = seq;
@@ -85,9 +132,37 @@ static void native_submit_event(struct audit_record *rec) {
   g_prev_hash = rec->curr_hash;
 
   memcpy(&ring[seq & RING_MASK], rec, sizeof(*rec));
-
+   
+  if (rec->event_type != AUDIT_EVENT_HEARTBEAT) {
+    tpm_batch[tpm_batch_count++] = *rec;
+    if (tpm_batch_count == BATCH_SIZE) {
+		memcpy(flush_batch, tpm_batch, sizeof(flush_batch));
+	 	do_flush = true;
+		tpm_batch_count = 0;
+    }
+  }
   spin_unlock_irqrestore(&ring_lock, flags);
+// wake_up_interruptible(&ring_wq);
+
+  if (do_flush) {
+    int hash_ret = tpm_store_batch(flush_batch, BATCH_SIZE);
+    if (hash_ret == 0) {
+        spin_lock_irqsave(&hash_fifo_lock, flags);
+        if ((hash_fifo_head - hash_fifo_tail) < HASH_FIFO_SIZE) {
+            memcpy(hash_fifo[hash_fifo_head & HASH_FIFO_MASK],
+                   last_batch_hash, 32);
+            hash_fifo_head++;
+        } else {
+            pr_warn("hash_fifo overflow — increase HASH_FIFO_SIZE\n");
+        }
+        spin_unlock_irqrestore(&hash_fifo_lock, flags);
+    } else {
+        pr_warn("tpm_store_batch failed (%d), skipping hash push\n", hash_ret);
+    }
+  }
+
   wake_up_interruptible(&ring_wq);
+  return;
 }
 
 /* ----------------------- Kprobes / Kretprobe * --------------------------*/
@@ -246,12 +321,21 @@ static struct kprobe kp_perf_event_set = {
  * creates persistent reference in /sys/fs/bpf/
  */
 static int pre_bpf_obj_pin_user(struct kprobe *p, struct pt_regs *regs) {
+  char __user *pathname;
   struct audit_record rec;
+  long ret;
+
   memset(&rec, 0, sizeof(rec));
   get_task_comm(rec.comm, current);
   fill_process_ctx(&rec);
   rec.event_type = AUDIT_EVENT_PIN;
   rec.source = AUDIT_SOURCE_PIN;
+
+  pathname = (char __user *)regs->si;
+  ret = strncpy_from_user(rec.path, pathname, sizeof(rec.path) - 1);
+  if (ret < 0)
+     rec.path[0] = '\0'; 
+
   native_submit_event(&rec);
   return 0;
 }
@@ -328,6 +412,15 @@ static int bpfledger_release(struct inode *inode, struct file *file) {
 
 static ssize_t bpfledger_read(struct file *file, char __user *buf, size_t count,
                               loff_t *offset) {
+hb:
+   if (atomic_read(&hb_avail)) {
+	if (copy_to_user(buf, &hb_slot, sizeof(hb_slot)))
+		return -EFAULT;
+	atomic_set(&hb_avail, 0);
+	return sizeof(hb_slot);
+   }
+
+
   struct reader_state *rs = file->private_data;
   struct audit_record rec;
   u64 head, pos_before;
@@ -344,9 +437,11 @@ retry:
   if (rs->pos >= head) {
     if (file->f_flags & O_NONBLOCK)
       return -EAGAIN;
-    ret = wait_event_interruptible(ring_wq, ring_head > rs->pos);
+    ret = wait_event_interruptible(ring_wq, ring_head > rs->pos || atomic_read(&hb_avail));
     if (ret)
       return ret;
+    if (atomic_read(&hb_avail))
+      goto hb;
     goto retry;
   }
 
@@ -371,10 +466,16 @@ retry:
 static __poll_t bpfledger_poll(struct file *file, poll_table *wait) {
   struct reader_state *rs = file->private_data;
   poll_wait(file, &ring_wq, wait);
+
+
+ if (atomic_read(&hb_avail))
+     return EPOLLIN | EPOLLRDNORM;
+
+
   spin_lock_irq(&ring_lock);
   if (rs->pos < ring_head) {
     spin_unlock_irq(&ring_lock);
-    return POLLIN | POLLRDNORM;
+    return EPOLLIN | EPOLLRDNORM;
   }
   spin_unlock_irq(&ring_lock);
   return 0;
@@ -395,9 +496,14 @@ static int __init bpfledger_init(void) {
   dev_t dev;
   get_random_bytes(&siphash_key, sizeof(siphash_key));
 
-  ret = alloc_chrdev_region(&dev, 0, 1, DEVICE_NAME);
+  ret = bpfaudit_heartbeat_init(&hb_ctx);
   if (ret < 0)
     return ret;
+
+  ret = alloc_chrdev_region(&dev, 0, 1, DEVICE_NAME);
+  if (ret < 0)
+    goto err_heartbeat;
+
   g_major = MAJOR(dev);
 
   /* cdev */
@@ -409,10 +515,16 @@ static int __init bpfledger_init(void) {
   /* Class registration*/
   if ((ret = class_register(&bpfledger_class)))
     goto err_class;
-  if (IS_ERR(device_create(&bpfledger_class, NULL, dev, NULL, DEVICE_NAME))) {
+
+  bpfaudit_dev = device_create(&bpfledger_class, NULL, dev, NULL, DEVICE_NAME);
+  if (IS_ERR(bpfaudit_dev)) {
     ret = -ENOMEM;
     goto err_device;
   }
+
+  ret = device_create_file(bpfaudit_dev, &dev_attr_batch_hash);
+  if (ret)
+     pr_err("sysfs batch_hash create field: %d\n", ret); 
 
   register_kprobe(&kp_bpf_check);
   register_kprobe(&kp_bpf_prog_new_fd);
@@ -435,11 +547,17 @@ err_class:
   cdev_del(&g_cdev);
 err_cdev:
   unregister_chrdev_region(dev, 1);
+  bpfaudit_heartbeat_exit();    
+  return ret;
+err_heartbeat:
+  bpfaudit_heartbeat_exit();
   return ret;
 }
 
 static void __exit bpfledger_exit(void) {
   dev_t dev = MKDEV(g_major, 0);
+ 
+  bpfaudit_heartbeat_exit();
   unregister_kprobe(&kp_bpf_prog_put_deferred);
   unregister_kprobe(&kp_bpf_obj_pin_user);
   unregister_kprobe(&kp_perf_event_set);
@@ -448,6 +566,8 @@ static void __exit bpfledger_exit(void) {
   unregister_kprobe(&kp_bpf_prog_new_fd);
   unregister_kprobe(&kp_bpf_check);
 
+
+  device_remove_file(bpfaudit_dev, &dev_attr_batch_hash);
   device_destroy(&bpfledger_class, dev);
   class_unregister(&bpfledger_class);
   cdev_del(&g_cdev);
