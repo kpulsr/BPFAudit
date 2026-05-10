@@ -11,24 +11,19 @@
 #include <linux/types.h>
 #endif
 /* Event sources */
-#define AUDIT_SOURCE_LSM 0 
-#define AUDIT_SOURCE_LSM_FREE 1
-#define AUDIT_SOURCE_LSM_BPF  2 
-
-
+#define AUDIT_SOURCE_FPROBE 1
+#define AUDIT_SOURCE_KPROBE 2
 
 /* Event types */
-#define AUDIT_EVENT_LOAD    0  
-#define AUDIT_EVENT_FREE    1
+#define AUDIT_EVENT_LOAD    0
+#define AUDIT_EVENT_ATTACH  1
 #define AUDIT_EVENT_PIN     2
-#define AUDIT_EVENT_GET     3
-#define AUDIT_EVENT_ATTACH  4
-#define AUDIT_EVENT_DETACH  5
-#define AUDIT_SOURCE_KPROBE 6
-#define AUDIT_SOURCE_PIN    7 
-#define AUDIT_SOURCE_LINK   8
-#define AUDIT_EVENT_INTENT  9 
+#define AUDIT_EVENT_DETACH  3
+#define AUDIT_EVENT_CLOSE   4
+#define AUDIT_EVENT_FREE    5
+#define AUDIT_EVENT_BATCH_ANCHOR 6  
 
+/* TAG AND COMM SIZE */
 #define AUDIT_PROG_TAG_SIZE 8
 #define AUDIT_COMM_SIZE 16
 
@@ -38,7 +33,6 @@
  *
  * seq and hashes are filled by the kernel module
  */
-
 struct audit_record {
   u64 seq;
   u64 timestamp_ns;

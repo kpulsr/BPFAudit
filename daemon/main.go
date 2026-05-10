@@ -9,18 +9,16 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"time"
-	"os/exec"
-	"encoding/base64"
-	"encoding/hex"
+	"crypto/tls"
+    "crypto/x509"
+	"github.com/google/go-tpm/tpm2"
 )
 
 const (
 	AUDIT_EVENT_HEARTBEAT = 10
+	AUDIT_EVENT_BATCH_ANCHOR = 6
 	RECORD_SIZE           = 168
-	BATCH_MAX             = 32
-	BATCH_TIMEOUT         = 60 * time.Second
 	ATTESTOR_URL          = "http://127.0.0.1:9000/ingest"
 	DEVICE                = "/dev/bpfaudit"
 )
@@ -73,52 +71,6 @@ type Batch struct {
 	Records     []WireRecord `json:"records"`
 }
 
-
-// Sign the hex hash with TPM persistent key 0x81000003
-func tpmsign(hexHash string) string {
-	if hexHash == "" {
-		return ""
-	}
-	hashBytes, err := hex.DecodeString(hexHash)
-	if err != nil || len(hashBytes) != 32 {
-		return ""
-	}
-
-	// write raw 32-byte digest
-	os.WriteFile("/tmp/bpfaudit_hash.bin", hashBytes, 0600)
-
-	cmd := exec.Command("tpm2_sign", "-c", "0x81000003", "-g", "sha256", "-d",
-		"-o", "/tmp/bpfaudit_sig.bin", "/tmp/bpfaudit_hash.bin")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[DAEMON] tpm2_sign failed: %v %s", err, out)
-		return ""
-	}
-
-	sig, err := os.ReadFile("/tmp/bpfaudit_sig.bin")
-	if err != nil || len(sig) <= 6 {
-		return ""
-	}
-
-	// skip 6-byte TPM header (alg 2 + hash 2 + len 2)
-	return base64.StdEncoding.EncodeToString(sig[6:])
-}
-
-func getKernelHash() string {
-	deadline := time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		b, err := os.ReadFile("/sys/class/bpfaudit/bpfaudit/batch_hash")
-		if err != nil {
-			return ""
-		}
-		h := strings.TrimSpace(string(b))
-		if h != "" {
-			return h
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	return ""
-}
-
 func toWire(r *AuditRecord) WireRecord {
 	return WireRecord{
 		Seq:         r.Seq,
@@ -150,21 +102,78 @@ func nullStr(b []byte) string {
 	return string(b)
 }
 
+
+
+func getQuote(nonce []byte) ([]byte, error) {
+    rwc, err := tpm2.OpenTPM("/dev/tpmrm0")
+    if err != nil { return nil, err }
+    defer rwc.Close()
+
+    pcrSel := tpm2.PCRSelection{
+        Hash: tpm2.AlgSHA256,
+        PCRs: []int{23},
+    }
+    quote, _, err := tpm2.Quote(rwc, 
+        tpm2.HandleEndorsement, 
+        "", "", nonce, pcrSel, tpm2.AlgNull)
+    return quote, err
+}
+
+
+/*------- mTLS ------- */
+var tlsClient *http.Client
+func init() {
+    caCert, err := os.ReadFile("/etc/bpfaudit/certs/ca-cert.pem")
+    if err != nil {
+        log.Fatalf("ca-cert.pem: %v", err)
+    }
+    caPool := x509.NewCertPool()
+    caPool.AppendCertsFromPEM(caCert)
+
+    cert, err := tls.LoadX509KeyPair(
+	"/etc/bpfaudit/certs/client-cert.pem", "/etc/bpfaudit/certs/client-key.pem")
+    if err != nil {
+        log.Fatalf("client cert: %v", err)
+    }
+
+    tlsConfig := &tls.Config{
+        Certificates: []tls.Certificate{cert},
+        RootCAs:      caPool,
+		InsecureSkipVerify: true,
+    }
+
+    tlsClient = &http.Client{
+        Transport: &http.Transport{TLSClientConfig: tlsConfig},
+        Timeout:   10 * time.Second,
+    }
+}
+/*---------------------*/
+
 func send(batch Batch) {
 	data, err := json.Marshal(batch)
 	if err != nil {
 		log.Printf("[DAEMON] marshal error: %v", err)
 		return
 	}
-	resp, err := http.Post(ATTESTOR_URL, "application/json", bytes.NewReader(data))
-	if err != nil {
-		log.Printf("[DAEMON] send error: %v", err)
-		return
-	}
+
+	req, err := http.NewRequest("POST", "https://127.0.0.1:9000/ingest", bytes.NewReader(data))
+    if err != nil {
+        log.Printf("[DAEMON] req error: %v", err)
+        return
+    }
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := tlsClient.Do(req)
+    if err != nil {
+        log.Printf("[DAEMON] send error: %v", err)
+        return
+    }
+
 	resp.Body.Close()
 	log.Printf("[DAEMON] sent batch heartbeat=%v records=%d hash=%s",
 		batch.IsHeartbeat, len(batch.Records), batch.KernelHash)
 }
+
 
 func main() {
 	dev, err := os.Open(DEVICE)
@@ -174,14 +183,9 @@ func main() {
 	defer dev.Close()
 	log.Printf("[DAEMON] reading %s → %s", DEVICE, ATTESTOR_URL)
 
-	var (
-		buf   [BATCH_MAX]WireRecord
-		count int
-		//batchStart time.Time
-	)
 
-	//var lastKernelHash string
-	rawBuf := make([]byte, RECORD_SIZE)
+	var pendingRecords []WireRecord
+    rawBuf := make([]byte, RECORD_SIZE)
 
 	for {
 		_, err := dev.Read(rawBuf)
@@ -203,16 +207,39 @@ func main() {
 			continue
 		}
 
-		buf[count] = toWire(&rec)
-		count++
+		if rec.EventType == AUDIT_EVENT_BATCH_ANCHOR {
+            /* path[0:32] = batch_hash, path[32:64] = hmac tag */
+			log.Printf("[DAEMON] anchor hash=%x", rec.Path[0:32])
+    		log.Printf("[DAEMON] anchor sig=%x", rec.Path[32:64])
+			log.Printf("[DAEMON] anchor received, pendingRecords count=%d", len(pendingRecords))
+            kernelHash := fmt.Sprintf("%x", rec.Path[0:32])
+            sig        := fmt.Sprintf("%x", rec.Path[32:64])
+			endSeq := uint64(rec.ProgType)<<32 | uint64(rec.ProgId)
+			split := 0
+			
+			for i, wr := range pendingRecords {
+        		if wr.Seq > endSeq {
+            		break
+        		}
+        		split = i + 1
+    		}
 
-		if count == BATCH_MAX {
-			kernelHash := getKernelHash()
-			sig := tpmsign(kernelHash)
-			toSend := Batch{IsHeartbeat: false, KernelHash: kernelHash,Signature: sig ,Records: make([]WireRecord, count)}
-			copy(toSend.Records, buf[:count])
-			count = 0
-			send(toSend)
+    		if split > 0 {
+				log.Printf("split is = %d",split)
+        		send(Batch{
+            		IsHeartbeat: false,
+            		KernelHash:  kernelHash,
+            		Signature:   sig,
+            		Records:     pendingRecords[:split],
+        		})
+        		pendingRecords = pendingRecords[split:]
+    		} else if len(pendingRecords) > 0 {
+                log.Printf("[DAEMON] GAP: anchor endSeq=%d but first pending=%d", 
+					endSeq, pendingRecords[0].Seq)
+			}
+            continue
 		}
+
+		pendingRecords = append(pendingRecords, toWire(&rec))
 	}
 }

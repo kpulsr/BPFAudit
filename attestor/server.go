@@ -2,15 +2,13 @@
 package main
 
 import (
-	"crypto"
-	"crypto/rsa"
+	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"crypto/tls"
+    "crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"log"
 	"net/http"
@@ -19,18 +17,16 @@ import (
 	"time"
 )
 
-
-
-var tpmPubKey *rsa.PublicKey
+var hmacSecret []byte
 
 func init() {
-	b, _ := os.ReadFile("pubkey.pem")
-	block, _ := pem.Decode(b)
-	pub, _ := x509.ParsePKIXPublicKey(block.Bytes)
-	tpmPubKey = pub.(*rsa.PublicKey)
+    raw := os.Getenv("AUDIT_HMAC_KEY")
+    b, err := hex.DecodeString(raw)
+    if err != nil || len(b) != 32 {
+        log.Fatalf("AUDIT_HMAC_KEY must be 64 hex chars")
+    }
+    hmacSecret = b
 }
-
-
 
 const (
 	LISTEN             = ":9000"
@@ -84,12 +80,13 @@ type LedgerEntry struct {
 type Attestor struct {
 	mu              sync.Mutex
 	lastSeq         uint64
-	lastHash        uint64
 	initialized     bool
 	lastHeartbeatAt time.Time
 	heartbeatSeen   bool
 	ledger          *os.File
 	alerts          *os.File
+	epochK          [32]byte
+	epochNum        uint64
 }
 
 func NewAttestor() (*Attestor, error) {
@@ -101,7 +98,9 @@ func NewAttestor() (*Attestor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("alerts: %w", err)
 	}
-	return &Attestor{ledger: ledger, alerts: alerts}, nil
+	att := &Attestor{ledger: ledger, alerts: alerts}
+	copy(att.epochK[:], hmacSecret)
+	return att, nil 
 }
 
 func (a *Attestor) alert(format string, args ...any) {
@@ -199,14 +198,6 @@ func (a *Attestor) verify(batch Batch, now time.Time) LedgerEntry {
 
 	first := batch.Records[0]
 
-	// ── cross-batch hash continuity ──
-	if a.initialized && first.PrevHash != a.lastHash {
-		msg := fmt.Sprintf("cross-batch hash break at seq=%d", first.Seq)
-		entry.Errors = append(entry.Errors, msg)
-		entry.OK = false
-		a.alert("%s", msg)
-	}
-
 	// ── sequence gap ──
 	if a.initialized && first.Seq != a.lastSeq+1 {
 		msg := fmt.Sprintf("seq gap: expected %d got %d", a.lastSeq+1, first.Seq)
@@ -225,23 +216,15 @@ func (a *Attestor) verify(batch Batch, now time.Time) LedgerEntry {
 			entry.OK = false
 			a.alert("%s", msg)
 		}
-		if cur.PrevHash != prev.CurrHash {
-			msg := fmt.Sprintf("hash chain break at seq=%d", cur.Seq)
-			entry.Errors = append(entry.Errors, msg)
-			entry.OK = false
-			a.alert("%s", msg)
-		}
 	}
 
 	// ── advance state ──
 	last := batch.Records[len(batch.Records)-1]
 	a.lastSeq = last.Seq
-	a.lastHash = last.CurrHash
 	a.initialized = true
 
 	// ── TPM batch hash verification (accumulate across batches) ──
 
-	fmt.Println("hi the batch size in attestor is:", len(batch.Records))
 	if batch.KernelHash != "" {
 		recomputed := recomputeHash(batch.Records)
 		entry.Recomputed = recomputed
@@ -249,40 +232,41 @@ func (a *Attestor) verify(batch Batch, now time.Time) LedgerEntry {
 		if recomputed == batch.KernelHash {
 			entry.HashOK = true
 			log.Printf("[ATTESTOR] hash verified OK for seqs %d..%d",
-				batch.Records[0].Seq, batch.Records[31].Seq)
+				batch.Records[0].Seq, batch.Records[len(batch.Records)-1].Seq)
 		} else {
 			entry.HashOK = false
 			entry.OK = false
 			a.alert("HASH MISMATCH seqs=%d..%d recomputed=%s kernel=%s",
-				batch.Records[0].Seq, batch.Records[31].Seq, recomputed, batch.KernelHash)
+				batch.Records[0].Seq, batch.Records[len(batch.Records)-1].Seq, recomputed, batch.KernelHash)
 		}
 	}
 
-	// ── TPM SIGNATURE VERIFICATION ── 
-	if batch.Signature != "" {
-		sigBytes, err := base64.StdEncoding.DecodeString(batch.Signature)
-		hashBytes, _ := hex.DecodeString(batch.KernelHash)
-		if err != nil || len(hashBytes) != 32 {
-			entry.SigOK = false
-			entry.OK = false
-			entry.Errors = append(entry.Errors, "sig/hash decode fail")
-			a.alert("sig/hash decode fail")
-		} else {
-			err = rsa.VerifyPKCS1v15(tpmPubKey, crypto.SHA256, hashBytes, sigBytes)
-			if err != nil {
-				entry.SigOK = false
-				entry.OK = false
-				entry.Errors = append(entry.Errors, "SIGNATURE INVALID")
-				a.alert("SIGNATURE INVALID")
-			} else {
-				entry.SigOK = true
-			}
-		}
-	} else {
+	// SIGNATURE VERIFICATION ──
+	if batch.Signature == "" {
 		entry.SigOK = false
 		entry.OK = false
-		entry.Errors = append(entry.Errors, "missing TPM signature")
-		a.alert("missing TPM signature")
+		entry.Errors = append(entry.Errors, "missing signature")
+		a.alert("missing signature")
+	} else {
+    	sigBytes, _ := hex.DecodeString(batch.Signature)
+    	hashBytes, _ := hex.DecodeString(batch.KernelHash)
+
+    	mac := hmac.New(sha256.New, a.epochK[:])
+    	mac.Write(hashBytes)
+    	expected := mac.Sum(nil)
+
+    	if hmac.Equal(expected, sigBytes) {
+        	entry.SigOK = true
+			next := sha256.Sum256(a.epochK[:])
+			copy(a.epochK[:], next[:])
+			a.epochNum++
+			log.Printf("[ATTESTOR] sig OK epoch=%d", a.epochNum)
+    	} else {
+        	entry.SigOK = false
+        	entry.OK = false
+        	entry.Errors = append(entry.Errors, "HMAC INVALID")
+        	a.alert("HMAC INVALID seqs=%d..%d", entry.BatchSeqStart, entry.BatchSeqEnd)
+    	}
 	}
 
 	return entry
@@ -314,7 +298,7 @@ func (a *Attestor) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[ATTESTOR] batch hb=%v seqs=%d..%d hb_age=%.1fs hash_ok=%v sig_ok=%v → %s",
 		batch.IsHeartbeat, entry.BatchSeqStart, entry.BatchSeqEnd,
-		entry.SecsSinceLastHeartbeat, entry.HashOK, entry.SigOK,status)
+		entry.SecsSinceLastHeartbeat, entry.HashOK, entry.SigOK, status)
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -329,12 +313,42 @@ func main() {
 
 	go att.watchdog()
 
-	log.Printf("[ATTESTOR] listening %s | ledger=%s alerts=%s | hb_deadline=%s",
-		LISTEN, LEDGER_FILE, ALERT_FILE, HEARTBEAT_DEADLINE)
+	caCert, err := os.ReadFile("/etc/bpfaudit/certs/ca-cert.pem")
+	if err != nil {
+        log.Fatalf("ca-cert.pem: %v", err)
+    }
+
+	caPool := x509.NewCertPool()
+    caPool.AppendCertsFromPEM(caCert)
+
+	cert, err := tls.LoadX509KeyPair(
+		"/etc/bpfaudit/certs/server-cert.pem", "/etc/bpfaudit/certs/server-key.pem")
+    if err != nil {
+        log.Fatalf("server cert: %v", err)
+    }
+
+
+	tlsConfig := &tls.Config{
+        Certificates: []tls.Certificate{cert},
+        ClientCAs:    caPool,
+        ClientAuth:   tls.RequireAndVerifyClientCert,
+    }
+
+
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest", att.handle)
-	if err := http.ListenAndServe(LISTEN, mux); err != nil {
-		log.Fatalf("[ATTESTOR] server: %v", err)
-	}
+
+
+    server := &http.Server{
+        Addr:      LISTEN,
+        Handler:   mux,
+        TLSConfig: tlsConfig,
+    }
+
+	log.Printf("[ATTESTOR] mTLS listening %s", LISTEN)
+    if err := server.ListenAndServeTLS("", ""); err != nil {
+        log.Fatalf("[ATTESTOR] server: %v", err)
+    }
+
 }
