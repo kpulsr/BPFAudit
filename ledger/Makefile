@@ -9,7 +9,10 @@ ccflags-y += -I$(src)/include
 
 # Kernel module
 obj-m := bpfledger.o
-bpfledger-y := src/bpfledger_main.o src/bpfaudit_emit.o
+bpfledger-y := src/bpfledger_main.o \
+               src/bpfledger_ring.o \
+               src/bpfaudit_crypto.o \
+               src/bpfaudit_heartbeat.o
 
 
 all: module

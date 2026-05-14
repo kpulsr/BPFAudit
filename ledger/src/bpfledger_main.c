@@ -6,7 +6,8 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "bpfledger.h"
-#include "bpfaudit_emit.h"
+#include "bpfaudit_heartbeat.h"
+#include "bpfledger_ring.h"
 #include <linux/bpf.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
@@ -36,13 +37,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Meriah Ibrahim Abderrahim");
 MODULE_DESCRIPTION("Native BPF Ledger (Cryptographic, Container-Aware)");
 MODULE_VERSION("6.0-FINAL");
-
-/* --------------------------- Ring Buffer -------------------------*/
-#define RING_SIZE 65536
-#define RING_MASK (RING_SIZE - 1)
-#define BATCH_SIZE 16
-#define ANCHOR_FIFO_SIZE 64
-#define ANCHOR_FIFO_MASK (ANCHOR_FIFO_SIZE - 1)
 
 
 /* --------------------------- Init Flags ----------------------------------*/
@@ -75,27 +69,13 @@ static unsigned long init_flags;
 
 
 /* --------------------------- Global Variables ----------------------------*/
-static struct audit_record * ring;
-static u64 ring_head = 0;
-static DEFINE_SPINLOCK(ring_lock);
-static DECLARE_WAIT_QUEUE_HEAD(ring_wq);
-
-static struct audit_record events_batch[BATCH_SIZE];
-static struct audit_record flush_batch[BATCH_SIZE];
-static unsigned int batch_count = 0;
-
-static struct audit_record anchor_fifo[ANCHOR_FIFO_SIZE]; 
-static unsigned anchor_head = 0;
-static unsigned anchor_tail = 0;
-static DEFINE_SPINLOCK(anchor_lock);
-
-static struct audit_record hb_slot;
-static atomic_t hb_avail = ATOMIC_INIT(0);
-
-static void flush_partial_batch(void);
-static struct bpf_ring_ctx hb_ctx = { &hb_slot, &hb_avail, &ring_wq, flush_partial_batch};
-
 static struct device *bpfaudit_dev;
+static struct bpf_ring_ctx hb_ctx = {
+    .hb_slot      = &hb_slot,
+    .hb_avail     = &hb_avail,
+    .ring_wq      = &ring_wq,
+    .flush_partial = flush_partial_batch,
+};
 /* ----------------------------- Helpers -----------------------------------*/
 /**
 * fill_process_ctx - populate process and namespace identity fields in an audit record.
@@ -118,114 +98,6 @@ static void fill_process_ctx(struct audit_record *rec) {
       rec->u.ev.cgroup_id = (u64)cgroup_ino(css->dfl_cgrp); 
   else
       rec->u.ev.cgroup_id = 0; 
-}
-
-/**
- * submit a fully recored event to a ring buffer
- * fill the current hash and put the old current to be previous
- * to build a full chained sequence
- */
-static void native_submit_event(struct audit_record *rec) {
-  unsigned long flags;
-  u64 seq;
-
-  spin_lock_irqsave(&ring_lock, flags);
-  bool do_flush = false; 	
-
-  seq = ring_head++;
-  rec->seq = seq;
-  rec->timestamp_ns = ktime_get_ns();
-
-  memcpy(&ring[seq & RING_MASK], rec, sizeof(*rec));
-   
-  if (rec->event_type != AUDIT_EVENT_HEARTBEAT) {
-    events_batch[batch_count++] = *rec;
-    if (batch_count == BATCH_SIZE) {
-		memcpy(flush_batch, events_batch, sizeof(flush_batch));
-	 	do_flush = true;
-		batch_count = 0;
-    }
-  }
-  spin_unlock_irqrestore(&ring_lock, flags);
-
-  if (do_flush) {
-    struct batch_crypto_record * recc = batch_hash_sign(flush_batch, BATCH_SIZE);
-    if (!IS_ERR(recc)) {
-        struct audit_record anchor;
-        unsigned long aflags;
-        u64 end_seq = flush_batch[BATCH_SIZE - 1].seq;
-        memset(&anchor, 0, sizeof(anchor));
-        anchor.event_type   = AUDIT_EVENT_BATCH_ANCHOR;
-        anchor.timestamp_ns = ktime_get_ns();
-
-        anchor.u.anr.end_seq = end_seq;
-
-        memcpy(anchor.u.anr.batch_hash,      recc->hash,      32);
-        memcpy(anchor.u.anr.batch_hmac, recc->signature, 32);
-        kfree(recc);
-
-        spin_lock_irqsave(&anchor_lock, aflags);
-        anchor_fifo[anchor_head & ANCHOR_FIFO_MASK] = anchor;
-        anchor_head++;
-        spin_unlock_irqrestore(&anchor_lock, aflags);
-    } else {
-        pr_warn("bach_hash_store failed\n");
-    }
-  }
-  wake_up_interruptible(&ring_wq);
-  return;
-}
-
-
-
-static void flush_partial_batch(void)
-{
-    unsigned long flags;
-    unsigned int count;
-    struct audit_record *batch_copy;
-    unsigned long aflags;
-
-    spin_lock_irqsave(&ring_lock, flags);
-    if (batch_count == 0) {
-        spin_unlock_irqrestore(&ring_lock, flags);
-        return;
-    }
-    count = batch_count;
-
-    batch_copy = kmalloc(count * sizeof(struct audit_record), GFP_ATOMIC);
-    if (!batch_copy) {
-        spin_unlock_irqrestore(&ring_lock, flags);
-        pr_warn("flush_partial: alloc failed\n");
-        return;
-    }
-
-    memcpy(batch_copy, events_batch, count * sizeof(struct audit_record));
-    batch_count = 0;
-    spin_unlock_irqrestore(&ring_lock, flags);
-
-    struct batch_crypto_record *recc = batch_hash_sign(batch_copy, count);
-    u64 end_seq = batch_copy[count - 1].seq;
-    kfree(batch_copy);
-
-    if (!IS_ERR(recc)) {
-        struct audit_record anchor;
-
-        memset(&anchor, 0, sizeof(anchor));
-        anchor.event_type   = AUDIT_EVENT_BATCH_ANCHOR;
-        anchor.timestamp_ns = ktime_get_ns();
-        anchor.u.anr.end_seq = end_seq; 
-        memcpy(anchor.u.anr.batch_hash,      recc->hash,      32);
-        memcpy(anchor.u.anr.batch_hmac, recc->signature, 32);
-        kfree(recc);
-
-        spin_lock_irqsave(&anchor_lock, aflags);
-        anchor_fifo[anchor_head & ANCHOR_FIFO_MASK] = anchor;
-        anchor_head++;
-        spin_unlock_irqrestore(&anchor_lock, aflags);
-        wake_up_interruptible(&ring_wq);
-    } else {
-        pr_warn("flush_partial: batch_hash_sign failed\n");
-    }
 }
 
 /**
@@ -825,9 +697,10 @@ static ssize_t bpfledger_read(struct file *file, char __user *buf,
 
     if (count < sizeof(struct audit_record))
         return -EINVAL;
-
+retry: 
     /* Priority 1: heartbeat — always urgent */
     if (atomic_read(&hb_avail)) {
+        smp_rmb();
         if (copy_to_user(buf, &hb_slot, sizeof(hb_slot)))
             return -EFAULT;
         atomic_set(&hb_avail, 0);
@@ -877,12 +750,11 @@ static ssize_t bpfledger_read(struct file *file, char __user *buf,
     ret = wait_event_interruptible(ring_wq,
             ring_head > rs->pos ||
             atomic_read(&hb_avail) ||
-            anchor_head != anchor_tail);
+            READ_ONCE(anchor_head) != READ_ONCE(anchor_tail));
     if (ret)
         return ret;
 
-    /* Recurse via re-entry — re-evaluate priorities from top */
-    return bpfledger_read(file, buf, count, offset);
+    goto retry; 
 }
 
 static __poll_t bpfledger_poll(struct file *file, poll_table *wait) {
@@ -958,7 +830,7 @@ static void bpfledger_cleanup(void)
     if (init_flags & FLAG_HEARTBEAT)
         bpfaudit_heartbeat_exit();
     if (init_flags & FLAG_RING)
-        vfree(ring);
+        bpfledger_ring_exit();
 
     init_flags = 0;
 }
@@ -968,10 +840,10 @@ static int __init bpfledger_init(void)
     int ret;
     dev_t dev;
 
-    ring = vmalloc(RING_SIZE * sizeof(struct audit_record));
-    if (!ring)
+    if (bpfledger_ring_init()) {
+        pr_err("ring buffer alloc failed\n");
         return -ENOMEM;
-    memset(ring, 0, RING_SIZE * sizeof(struct audit_record));
+    }
     init_flags |= FLAG_RING;
 
     ret = bpfaudit_heartbeat_init(&hb_ctx);
