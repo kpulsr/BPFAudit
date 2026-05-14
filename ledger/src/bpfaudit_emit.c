@@ -45,24 +45,31 @@ out:
     return ret;
 }
 
-/* --- HAMC signing --- */
+/* --- HMAC signing --- */
 
-static void ratchet_key(void)
+static int ratchet_key(void)
 {
     struct crypto_shash *tfm;
     u8 K_next[HMAC_KEY_SIZE];
+    int ret;
 
     tfm = crypto_alloc_shash("sha256", 0, 0);
     if (IS_ERR(tfm)) {
         pr_err("ratchet: sha256 alloc failed\n");
-        return;
+        return PTR_ERR(tfm);
     }
-    crypto_shash_tfm_digest(tfm, K_current, HMAC_KEY_SIZE, K_next);
+    ret = crypto_shash_tfm_digest(tfm, K_current, HMAC_KEY_SIZE, K_next);
     crypto_free_shash(tfm);
+    if (ret) {
+        pr_err("ratchet: key derivation failed: %d — keeping old key\n", ret);
+        memzero_explicit(K_next, HMAC_KEY_SIZE);
+        return ret;
+    }
     memzero_explicit(K_current, HMAC_KEY_SIZE);
     memcpy(K_current, K_next, HMAC_KEY_SIZE);
     memzero_explicit(K_next, HMAC_KEY_SIZE);
     pr_info("key ratcheted\n");
+    return 0;
 }
 
 int bpfaudit_set_hmac_key(const u8 *key, size_t len)
@@ -90,8 +97,10 @@ static int compute_hmac(const u8 *data, size_t len, u8 *hmac_out)
         return PTR_ERR(tfm);
 
     ret = crypto_shash_setkey(tfm, K_current, HMAC_KEY_SIZE);
-    if (ret)
+    if (ret) {
+        pr_err("compute_hmac: setkey failed: %d\n", ret);
         goto out_free_tfm;
+    }
 
     desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_ATOMIC);
     if (!desc) {
@@ -109,8 +118,10 @@ static int compute_hmac(const u8 *data, size_t len, u8 *hmac_out)
         goto out_free_desc;
 
     ret = crypto_shash_final(desc, hmac_out);
-    if (ret == 0)
-        pr_info("compute_hmac OK: %*phN\n", 32, hmac_out);
+    if (ret) {
+        pr_err("batch_hash_sign: sha256 final failed: %d\n", ret);
+        goto out_free_desc;
+    }
 
 out_free_desc:
     kfree(desc);
@@ -149,16 +160,25 @@ struct batch_crypto_record * batch_hash_sign(struct audit_record *batch, unsigne
     memcpy(rec->hash, digest, BATCH_HASH_SIZE);
 
     ret = compute_hmac(digest, BATCH_HASH_SIZE, rec->signature);
-    if (ret) goto err_free_desc;
+    if (ret) {
+        pr_err("batch_hash_sign: HMAC failed: %d\n", ret);
+        goto err_free_desc;
+    }
 
-    ratchet_key();
+    ret = ratchet_key();
+    if (ret)
+        pr_warn("batch_hash_sign: key ratchet failed, next batch HMAC will use old key: %d\n",
+                ret);
 
     kfree(desc); crypto_free_shash(tfm);
     return rec;
 
-err_free_desc: kfree(desc);
-err_free_tfm:  crypto_free_shash(tfm);
-err_free_rec:  kfree(rec);
+err_free_desc:
+    kfree(desc);
+err_free_tfm:
+    crypto_free_shash(tfm);
+err_free_rec:
+    kfree(rec);
     return ERR_PTR(ret);
 }
 
@@ -184,6 +204,11 @@ static enum hrtimer_restart hb_fn(struct hrtimer *timer) {
 
 int bpfaudit_heartbeat_init(struct bpf_ring_ctx *ctx) {
   int ret; 
+
+  if (!ctx || !ctx->hb_slot || !ctx->hb_avail || !ctx->ring_wq) {
+      pr_err("heartbeat_init: invalid context\n");
+      return -EINVAL;
+  }
   g_ctx = ctx;
 
   ret = fetch_hmac_key();

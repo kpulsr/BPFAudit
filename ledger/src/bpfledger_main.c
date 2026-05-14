@@ -43,13 +43,44 @@ MODULE_VERSION("6.0-FINAL");
 #define BATCH_SIZE 16
 #define ANCHOR_FIFO_SIZE 64
 #define ANCHOR_FIFO_MASK (ANCHOR_FIFO_SIZE - 1)
+
+
+/* --------------------------- Init Flags ----------------------------------*/
+/*
+ * bpfledger_cleanup() checks these to know what needs to be torn down,
+ * used by both the error path in init and by __exit.
+ */
+#define FLAG_RING                BIT(0)
+#define FLAG_HEARTBEAT           BIT(1)
+#define FLAG_CHRDEV              BIT(2)
+#define FLAG_CDEV                BIT(3)
+#define FLAG_CLASS               BIT(4)
+#define FLAG_DEVICE              BIT(5)
+#define FLAG_PROBE_NEW_FD        BIT(6)
+#define FLAG_PROBE_LINK_SETTLE   BIT(7)
+#define FLAG_PROBE_LINK_FREE     BIT(8)
+#define FLAG_PROBE_REG           BIT(9)
+#define FLAG_PROBE_UNREG         BIT(10)
+#define FLAG_PROBE_PERF_DETACH   BIT(11)
+#define FLAG_PROBE_PERF_SET      BIT(12)
+#define FLAG_PROBE_CBPF_CREATE   BIT(13)
+#define FLAG_PROBE_CBPF_DESTROY  BIT(14)
+#define FLAG_PROBE_CGROUP_ATTACH BIT(15)
+#define FLAG_PROBE_CGROUP_DETACH BIT(16)
+#define FLAG_PROBE_PIN           BIT(17)
+#define FLAG_PROBE_RELEASE       BIT(18)
+#define FLAG_PROBE_PUT_DEFERRED  BIT(19)
+
+static unsigned long init_flags;
+
+
 /* --------------------------- Global Variables ----------------------------*/
-static struct audit_record ring[RING_SIZE];
+static struct audit_record * ring;
 static u64 ring_head = 0;
 static DEFINE_SPINLOCK(ring_lock);
 static DECLARE_WAIT_QUEUE_HEAD(ring_wq);
 
-static struct audit_record tpm_batch[BATCH_SIZE];
+static struct audit_record events_batch[BATCH_SIZE];
 static struct audit_record flush_batch[BATCH_SIZE];
 static unsigned int batch_count = 0;
 
@@ -67,10 +98,10 @@ static struct bpf_ring_ctx hb_ctx = { &hb_slot, &hb_avail, &ring_wq, flush_parti
 static struct device *bpfaudit_dev;
 /* ----------------------------- Helpers -----------------------------------*/
 /**
- * extract all possible data of the current process
- * responsible for LOAD, ATTACH, DETTACH and FREE / PIN
- * namespace is for containers env
- */
+* fill_process_ctx - populate process and namespace identity fields in an audit record.
+* Captures pid, tgid, uid, gid, pid namespace inode, and cgroup id from current.
+* Called by emit_prog_event() for every lifecycle event.
+*/
 static void fill_process_ctx(struct audit_record *rec) {
   struct css_set *css; 
 
@@ -90,7 +121,7 @@ static void fill_process_ctx(struct audit_record *rec) {
 }
 
 /**
- * submit a full recoded event to a ringbuffer
+ * submit a fully recored event to a ring buffer
  * fill the current hash and put the old current to be previous
  * to build a full chained sequence
  */
@@ -108,9 +139,9 @@ static void native_submit_event(struct audit_record *rec) {
   memcpy(&ring[seq & RING_MASK], rec, sizeof(*rec));
    
   if (rec->event_type != AUDIT_EVENT_HEARTBEAT) {
-    tpm_batch[batch_count++] = *rec;
+    events_batch[batch_count++] = *rec;
     if (batch_count == BATCH_SIZE) {
-		memcpy(flush_batch, tpm_batch, sizeof(flush_batch));
+		memcpy(flush_batch, events_batch, sizeof(flush_batch));
 	 	do_flush = true;
 		batch_count = 0;
     }
@@ -168,7 +199,7 @@ static void flush_partial_batch(void)
         return;
     }
 
-    memcpy(batch_copy, tpm_batch, count * sizeof(struct audit_record));
+    memcpy(batch_copy, events_batch, count * sizeof(struct audit_record));
     batch_count = 0;
     spin_unlock_irqrestore(&ring_lock, flags);
 
@@ -193,7 +224,7 @@ static void flush_partial_batch(void)
         spin_unlock_irqrestore(&anchor_lock, aflags);
         wake_up_interruptible(&ring_wq);
     } else {
-        pr_warn("flush_partial: batch_hash_store failed\n");
+        pr_warn("flush_partial: batch_hash_sign failed\n");
     }
 }
 
@@ -552,7 +583,10 @@ static int fp_bpf_obj_pin_user(struct fprobe *fp, unsigned long ip,
 static struct fprobe fps_bpf_obj_pin_user = {.entry_handler = fp_bpf_obj_pin_user};
 
 
-/**/
+/**
+ * fp_cgroup_bpf_attach - capture cgroup BPF program attachment
+ * Hooks __cgroup_bpf_attach(), the legacy BPF_PROG_ATTACH path for cgroup types.
+ */
 static int fp_cgroup_bpf_attach(struct fprobe *fp, unsigned long ip,
     unsigned long ret_ip, struct ftrace_regs *fregs, void *data)
 {
@@ -568,7 +602,10 @@ static int fp_cgroup_bpf_attach(struct fprobe *fp, unsigned long ip,
 static struct fprobe fps_cgroup_bpf_attach = {.entry_handler = fp_cgroup_bpf_attach};
 
 
-/**/
+/**
+ * fp_cgroup_bpf_detach - capture cgroup BPF program detachment
+ * Hooks __cgroup_bpf_detach(), the legacy BPF_PROG_DETACH path for cgroup types.
+ */
 static int fp_cgroup_bpf_detach(struct fprobe *fp, unsigned long ip,
     unsigned long ret_ip, struct ftrace_regs *fregs, void *data)
 {
@@ -620,10 +657,10 @@ static struct kprobe kp_bpf_probe_unregister = {
 };
 
 
-/*
- * put_deferred runs in a kworker context so we never know who realy closed the FD 
- * this runs before deferred work, still inside the real process
- * */
+// after:
+/* bpf_prog_release runs before deferred work, still in the real process context.
+ * Captures the closing process identity before bpf_prog_put_deferred() runs
+ * in a kworker where the original caller is no longer available. */
 static int fp_bpf_prog_release(struct fprobe *fp, unsigned long ip,
     unsigned long ret_ip, struct ftrace_regs *fregs, void *data) {
 
@@ -718,7 +755,7 @@ static struct kretprobe krp_cbpf_create = {
     .entry_handler = krp_cbpf_entry,
     .data_size     = sizeof(struct cbpf_load_data),
     .maxactive     = 32,
-    .kp.symbol_name = "sk_attach_filter",  /* ← direct SO_ATTACH_FILTER path */
+    .kp.symbol_name = "sk_attach_filter", 
 };
 /*===========================================================================*/
 
@@ -741,7 +778,7 @@ static int kp_sk_filter_release_rcu_handler(struct kprobe *p, struct pt_regs *re
 }
 
 static struct kprobe kp_cbpf_destroy = {
-    .symbol_name = "sk_filter_release_rcu",  // ← was sk_detach_filter
+    .symbol_name = "sk_filter_release_rcu", 
     .pre_handler = kp_sk_filter_release_rcu_handler,
 };
 
@@ -876,108 +913,174 @@ static const struct file_operations bpfledger_fops = {
 
 /* ----------------------------- init/exit -----------------------------------*/
 
-static int __init bpfledger_init(void) {
-  int ret;
-  dev_t dev;
+static void bpfledger_cleanup(void)
+{
+    dev_t dev = MKDEV(g_major, 0);
 
-  ret = bpfaudit_heartbeat_init(&hb_ctx);
-  if (ret < 0)
+    if (init_flags & FLAG_PROBE_PUT_DEFERRED)
+        unregister_fprobe(&fps_bpf_prog_put_deferred);
+    if (init_flags & FLAG_PROBE_RELEASE)
+        unregister_fprobe(&fps_bpf_prog_release);
+    if (init_flags & FLAG_PROBE_PIN)
+        unregister_fprobe(&fps_bpf_obj_pin_user);
+    if (init_flags & FLAG_PROBE_CGROUP_DETACH)
+        unregister_fprobe(&fps_cgroup_bpf_detach);
+    if (init_flags & FLAG_PROBE_CGROUP_ATTACH)
+        unregister_fprobe(&fps_cgroup_bpf_attach);
+    if (init_flags & FLAG_PROBE_CBPF_DESTROY)
+        unregister_kprobe(&kp_cbpf_destroy);
+    if (init_flags & FLAG_PROBE_CBPF_CREATE)
+        unregister_kretprobe(&krp_cbpf_create);
+    if (init_flags & FLAG_PROBE_PERF_SET)
+        unregister_fprobe(&fps_perf_event_set);
+    if (init_flags & FLAG_PROBE_PERF_DETACH)
+        unregister_kprobe(&kp_perf_event_detach);
+    if (init_flags & FLAG_PROBE_UNREG)
+        unregister_kprobe(&kp_bpf_probe_unregister);
+    if (init_flags & FLAG_PROBE_REG)
+        unregister_kprobe(&kp_bpf_probe_register);
+    if (init_flags & FLAG_PROBE_LINK_FREE)
+        unregister_fprobe(&fps_bpf_link_free);
+    if (init_flags & FLAG_PROBE_LINK_SETTLE)
+        unregister_fprobe(&fps_bpf_link_settle);
+    if (init_flags & FLAG_PROBE_NEW_FD)
+        unregister_fprobe(&fps_bpf_prog_new_fd);
+
+    if (init_flags & FLAG_DEVICE)
+        device_destroy(&bpfledger_class, dev);
+    if (init_flags & FLAG_CLASS)
+        class_unregister(&bpfledger_class);
+    if (init_flags & FLAG_CDEV)
+        cdev_del(&g_cdev);
+    if (init_flags & FLAG_CHRDEV)
+        unregister_chrdev_region(dev, 1);
+
+    if (init_flags & FLAG_HEARTBEAT)
+        bpfaudit_heartbeat_exit();
+    if (init_flags & FLAG_RING)
+        vfree(ring);
+
+    init_flags = 0;
+}
+
+static int __init bpfledger_init(void)
+{
+    int ret;
+    dev_t dev;
+
+    ring = vmalloc(RING_SIZE * sizeof(struct audit_record));
+    if (!ring)
+        return -ENOMEM;
+    memset(ring, 0, RING_SIZE * sizeof(struct audit_record));
+    init_flags |= FLAG_RING;
+
+    ret = bpfaudit_heartbeat_init(&hb_ctx);
+    if (ret < 0) {
+        pr_err("heartbeat init failed: %d\n", ret);
+        goto fail;
+    }
+    init_flags |= FLAG_HEARTBEAT;
+
+    ret = alloc_chrdev_region(&dev, 0, 1, DEVICE_NAME);
+    if (ret < 0) {
+        pr_err("alloc_chrdev_region failed: %d\n", ret);
+        goto fail;
+    }
+    init_flags |= FLAG_CHRDEV;
+    g_major = MAJOR(dev);
+
+    cdev_init(&g_cdev, &bpfledger_fops);
+    g_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&g_cdev, dev, 1);
+    if (ret) {
+        pr_err("cdev_add failed: %d\n", ret);
+        goto fail;
+    }
+    init_flags |= FLAG_CDEV;
+
+    ret = class_register(&bpfledger_class);
+    if (ret) {
+        pr_err("class_register failed: %d\n", ret);
+        goto fail;
+    }
+    init_flags |= FLAG_CLASS;
+
+    bpfaudit_dev = device_create(&bpfledger_class, NULL, dev, NULL, DEVICE_NAME);
+    if (IS_ERR(bpfaudit_dev)) {
+        ret = PTR_ERR(bpfaudit_dev);
+        pr_err("device_create failed: %d\n", ret);
+        goto fail;
+    }
+    init_flags |= FLAG_DEVICE;
+
+    ret = register_fprobe(&fps_bpf_prog_new_fd, "bpf_prog_new_fd", NULL);
+    if (ret) { pr_err("fprobe bpf_prog_new_fd failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_NEW_FD;
+
+    ret = register_fprobe(&fps_bpf_link_settle, "bpf_link_settle", NULL);
+    if (ret) { pr_err("fprobe bpf_link_settle failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_LINK_SETTLE;
+
+    ret = register_fprobe(&fps_bpf_link_free, "bpf_link_free", NULL);
+    if (ret) { pr_err("fprobe bpf_link_free failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_LINK_FREE;
+
+    ret = register_kprobe(&kp_bpf_probe_register);
+    if (ret) { pr_err("kprobe bpf_probe_register failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_REG;
+
+    ret = register_kprobe(&kp_bpf_probe_unregister);
+    if (ret) { pr_err("kprobe bpf_probe_unregister failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_UNREG;
+
+    ret = register_kprobe(&kp_perf_event_detach);
+    if (ret) { pr_err("kprobe perf_event_detach failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_PERF_DETACH;
+
+    ret = register_fprobe(&fps_perf_event_set, "perf_event_set_bpf_prog", NULL);
+    if (ret) { pr_err("fprobe perf_event_set failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_PERF_SET;
+
+    ret = register_kretprobe(&krp_cbpf_create);
+    if (ret) { pr_err("kretprobe cbpf_create failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_CBPF_CREATE;
+
+    ret = register_kprobe(&kp_cbpf_destroy);
+    if (ret) { pr_err("kprobe cbpf_destroy failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_CBPF_DESTROY;
+
+    ret = register_fprobe(&fps_cgroup_bpf_attach, "__cgroup_bpf_attach", NULL);
+    if (ret) { pr_err("fprobe cgroup_bpf_attach failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_CGROUP_ATTACH;
+
+    ret = register_fprobe(&fps_cgroup_bpf_detach, "__cgroup_bpf_detach", NULL);
+    if (ret) { pr_err("fprobe cgroup_bpf_detach failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_CGROUP_DETACH;
+
+    ret = register_fprobe(&fps_bpf_obj_pin_user, "bpf_obj_pin_user", NULL);
+    if (ret) { pr_err("fprobe bpf_obj_pin_user failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_PIN;
+
+    ret = register_fprobe(&fps_bpf_prog_release, "bpf_prog_release", NULL);
+    if (ret) { pr_err("fprobe bpf_prog_release failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_RELEASE;
+
+    ret = register_fprobe(&fps_bpf_prog_put_deferred, "bpf_prog_put_deferred", NULL);
+    if (ret) { pr_err("fprobe bpf_prog_put_deferred failed: %d\n", ret); goto fail; }
+    init_flags |= FLAG_PROBE_PUT_DEFERRED;
+
+    pr_info("loaded successfully\n");
+    return 0;
+
+fail:
+    bpfledger_cleanup();
     return ret;
-
-  ret = alloc_chrdev_region(&dev, 0, 1, DEVICE_NAME);
-  if (ret < 0)
-    goto err_heartbeat;
-
-  g_major = MAJOR(dev);
-
-  /* cdev */
-  cdev_init(&g_cdev, &bpfledger_fops);
-  g_cdev.owner = THIS_MODULE;
-  if ((ret = cdev_add(&g_cdev, dev, 1)))
-    goto err_cdev;
-
-  /* Class registration*/
-  if ((ret = class_register(&bpfledger_class)))
-    goto err_class;
-
-  bpfaudit_dev  = device_create(&bpfledger_class, NULL, dev, NULL, DEVICE_NAME);
-  if (IS_ERR(bpfaudit_dev)) {
-    ret = -ENOMEM;
-    goto err_device;
-  }
-
-  //register_kprobe(&kp_bpf_check);
-  register_fprobe(&fps_bpf_prog_new_fd,"bpf_prog_new_fd",NULL);
-  register_fprobe(&fps_bpf_link_settle,"bpf_link_settle", NULL);
-  register_fprobe(&fps_bpf_link_free,"bpf_link_free", NULL);
-  register_kprobe(&kp_bpf_probe_register);
-  register_kprobe(&kp_bpf_probe_unregister);
-  ret = register_kprobe(&kp_perf_event_detach);
-  if (ret) {
-    pr_err("bpfledger: perf_event_detach_bpf_prog fprobe failed: %d\n", ret);
-    goto err_fprobes;
-  } 
-  ret = register_fprobe(&fps_perf_event_set,"perf_event_set_bpf_prog", NULL);
-  if (ret) {
-    pr_err("bpfledger: perf_event_set_bpf_prog fprobe failed: %d\n", ret);
-    goto err_fprobes;
-  }
-  ret = register_kretprobe(&krp_cbpf_create);
-  if (ret)
-    pr_err("bpfledger: bpf_prog_create_from_user kretprobe failed: %d\n", ret);
-
-  ret = register_kprobe(&kp_cbpf_destroy);
-  if (ret)
-    pr_err("bpfledger: bpf_prog_destroy kprobe failed: %d\n", ret);
-  register_fprobe(&fps_cgroup_bpf_attach, "__cgroup_bpf_attach", NULL);
-  register_fprobe(&fps_cgroup_bpf_detach, "__cgroup_bpf_detach", NULL);
-  register_fprobe(&fps_bpf_obj_pin_user,"bpf_obj_pin_user", NULL);
-  register_fprobe(&fps_bpf_prog_release, "bpf_prog_release", NULL);
-  register_fprobe(&fps_bpf_prog_put_deferred, "bpf_prog_put_deferred",NULL);
-
-  return 0;
-
-err_fprobes:
-    unregister_fprobe(&fps_bpf_link_free);
-    unregister_fprobe(&fps_bpf_link_settle);
-    unregister_fprobe(&fps_bpf_prog_new_fd);
-err_device:
-  class_unregister(&bpfledger_class);
-err_class:
-  cdev_del(&g_cdev);
-err_cdev:
-  unregister_chrdev_region(dev, 1);
-  bpfaudit_heartbeat_exit();    
-  return ret;
-err_heartbeat:
-  bpfaudit_heartbeat_exit();
-  return ret;
 }
 
-static void __exit bpfledger_exit(void) {
-  dev_t dev = MKDEV(g_major, 0);
- 
-  bpfaudit_heartbeat_exit();
-  unregister_fprobe(&fps_bpf_prog_put_deferred);
-  unregister_fprobe(&fps_bpf_prog_release); 
-  unregister_fprobe(&fps_bpf_obj_pin_user);
-  unregister_fprobe(&fps_cgroup_bpf_attach);
-  unregister_fprobe(&fps_cgroup_bpf_detach);
-  unregister_kretprobe(&krp_cbpf_create);
-  unregister_kprobe(&kp_cbpf_destroy);
-  unregister_fprobe(&fps_perf_event_set);
-  unregister_kprobe(&kp_perf_event_detach);
-  unregister_kprobe(&kp_bpf_probe_register); 
-  unregister_kprobe(&kp_bpf_probe_unregister);
-  unregister_fprobe(&fps_bpf_link_free);
-  unregister_fprobe(&fps_bpf_link_settle);
-  unregister_fprobe(&fps_bpf_prog_new_fd);
-  //unregister_kprobe(&kp_bpf_check);
-
-  device_destroy(&bpfledger_class, dev);
-  class_unregister(&bpfledger_class);
-  cdev_del(&g_cdev);
-  unregister_chrdev_region(dev, 1);
+static void __exit bpfledger_exit(void)
+{
+    bpfledger_cleanup();
 }
+
 module_init(bpfledger_init);
 module_exit(bpfledger_exit);
