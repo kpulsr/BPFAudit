@@ -4,10 +4,10 @@ package main
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
-	"crypto/tls"
-    "crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -20,12 +20,12 @@ import (
 var hmacSecret []byte
 
 func init() {
-    raw := os.Getenv("AUDIT_HMAC_KEY")
-    b, err := hex.DecodeString(raw)
-    if err != nil || len(b) != 32 {
-        log.Fatalf("AUDIT_HMAC_KEY must be 64 hex chars")
-    }
-    hmacSecret = b
+	raw := os.Getenv("AUDIT_HMAC_KEY")
+	b, err := hex.DecodeString(raw)
+	if err != nil || len(b) != 32 {
+		log.Fatalf("AUDIT_HMAC_KEY must be 64 hex chars")
+	}
+	hmacSecret = b
 }
 
 const (
@@ -38,8 +38,6 @@ const (
 type WireRecord struct {
 	Seq         uint64 `json:"seq"`
 	TimestampNs uint64 `json:"timestamp_ns"`
-	PrevHash    uint64 `json:"prev_hash"`
-	CurrHash    uint64 `json:"curr_hash"`
 	Pid         uint32 `json:"pid"`
 	Tgid        uint32 `json:"tgid"`
 	Uid         uint32 `json:"uid"`
@@ -100,7 +98,7 @@ func NewAttestor() (*Attestor, error) {
 	}
 	att := &Attestor{ledger: ledger, alerts: alerts}
 	copy(att.epochK[:], hmacSecret)
-	return att, nil 
+	return att, nil
 }
 
 func (a *Attestor) alert(format string, args ...any) {
@@ -129,30 +127,29 @@ func (a *Attestor) watchdog() {
 func recomputeHash(recs []WireRecord) string {
 	h := sha256.New()
 	for _, r := range recs {
-		var b [168]byte // zero-initialized = matches kernel's zero pad bytes
+		var b [152]byte
 
+		// === MISSING — these MUST be included ===
 		binary.LittleEndian.PutUint64(b[0:8], r.Seq)
 		binary.LittleEndian.PutUint64(b[8:16], r.TimestampNs)
-		binary.LittleEndian.PutUint64(b[16:24], r.PrevHash)
-		binary.LittleEndian.PutUint64(b[24:32], r.CurrHash)
-		binary.LittleEndian.PutUint32(b[32:36], r.Pid)
-		binary.LittleEndian.PutUint32(b[36:40], r.Tgid)
-		binary.LittleEndian.PutUint32(b[40:44], r.Uid)
-		binary.LittleEndian.PutUint32(b[44:48], r.Gid)
-		binary.LittleEndian.PutUint64(b[48:56], r.CgroupId)
-		binary.LittleEndian.PutUint64(b[56:64], r.PidNsId)
-		binary.LittleEndian.PutUint32(b[64:68], r.ProgId)
-		binary.LittleEndian.PutUint32(b[68:72], r.ProgType)
-		b[72] = r.EventType
-		b[73] = r.Source
-		// b[74:80] = _pad[6] — already zero, matches kernel struct
+		// =========================================
 
+		b[16] = r.EventType
+		b[17] = r.Source
+		// padding bytes 18-23 stay zero (matches kernel memset)
+		binary.LittleEndian.PutUint32(b[24:28], r.Pid)
+		binary.LittleEndian.PutUint32(b[28:32], r.Tgid)
+		binary.LittleEndian.PutUint32(b[32:36], r.Uid)
+		binary.LittleEndian.PutUint32(b[36:40], r.Gid)
+		binary.LittleEndian.PutUint64(b[40:48], r.CgroupId)
+		binary.LittleEndian.PutUint64(b[48:56], r.PidNsId)
+		binary.LittleEndian.PutUint32(b[56:60], r.ProgId)
+		binary.LittleEndian.PutUint32(b[60:64], r.ProgType)
 		tag, _ := hex.DecodeString(r.ProgTag)
-		copy(b[80:88], tag)      // prog_tag[8]  — exact 8 bytes
-		copy(b[88:104], r.Comm)  // comm[16]     — null-padded by zero-init
-		copy(b[104:168], r.Path) // path[64]     — null-padded by zero-init
-
-		h.Write(b[:]) // stream into sha256, same as kernel's shash_update per record
+		copy(b[64:72], tag)
+		copy(b[72:88], []byte(r.Comm))
+		copy(b[88:152], []byte(r.Path))
+		h.Write(b[:])
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
@@ -248,25 +245,25 @@ func (a *Attestor) verify(batch Batch, now time.Time) LedgerEntry {
 		entry.Errors = append(entry.Errors, "missing signature")
 		a.alert("missing signature")
 	} else {
-    	sigBytes, _ := hex.DecodeString(batch.Signature)
-    	hashBytes, _ := hex.DecodeString(batch.KernelHash)
+		sigBytes, _ := hex.DecodeString(batch.Signature)
+		hashBytes, _ := hex.DecodeString(batch.KernelHash)
 
-    	mac := hmac.New(sha256.New, a.epochK[:])
-    	mac.Write(hashBytes)
-    	expected := mac.Sum(nil)
+		mac := hmac.New(sha256.New, a.epochK[:])
+		mac.Write(hashBytes)
+		expected := mac.Sum(nil)
 
-    	if hmac.Equal(expected, sigBytes) {
-        	entry.SigOK = true
+		if hmac.Equal(expected, sigBytes) {
+			entry.SigOK = true
 			next := sha256.Sum256(a.epochK[:])
 			copy(a.epochK[:], next[:])
 			a.epochNum++
 			log.Printf("[ATTESTOR] sig OK epoch=%d", a.epochNum)
-    	} else {
-        	entry.SigOK = false
-        	entry.OK = false
-        	entry.Errors = append(entry.Errors, "HMAC INVALID")
-        	a.alert("HMAC INVALID seqs=%d..%d", entry.BatchSeqStart, entry.BatchSeqEnd)
-    	}
+		} else {
+			entry.SigOK = false
+			entry.OK = false
+			entry.Errors = append(entry.Errors, "HMAC INVALID")
+			a.alert("HMAC INVALID seqs=%d..%d", entry.BatchSeqStart, entry.BatchSeqEnd)
+		}
 	}
 
 	return entry
@@ -315,40 +312,36 @@ func main() {
 
 	caCert, err := os.ReadFile("/etc/bpfaudit/certs/ca-cert.pem")
 	if err != nil {
-        log.Fatalf("ca-cert.pem: %v", err)
-    }
+		log.Fatalf("ca-cert.pem: %v", err)
+	}
 
 	caPool := x509.NewCertPool()
-    caPool.AppendCertsFromPEM(caCert)
+	caPool.AppendCertsFromPEM(caCert)
 
 	cert, err := tls.LoadX509KeyPair(
 		"/etc/bpfaudit/certs/server-cert.pem", "/etc/bpfaudit/certs/server-key.pem")
-    if err != nil {
-        log.Fatalf("server cert: %v", err)
-    }
-
+	if err != nil {
+		log.Fatalf("server cert: %v", err)
+	}
 
 	tlsConfig := &tls.Config{
-        Certificates: []tls.Certificate{cert},
-        ClientCAs:    caPool,
-        ClientAuth:   tls.RequireAndVerifyClientCert,
-    }
-
-
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ingest", att.handle)
 
-
-    server := &http.Server{
-        Addr:      LISTEN,
-        Handler:   mux,
-        TLSConfig: tlsConfig,
-    }
+	server := &http.Server{
+		Addr:      LISTEN,
+		Handler:   mux,
+		TLSConfig: tlsConfig,
+	}
 
 	log.Printf("[ATTESTOR] mTLS listening %s", LISTEN)
-    if err := server.ListenAndServeTLS("", ""); err != nil {
-        log.Fatalf("[ATTESTOR] server: %v", err)
-    }
+	if err := server.ListenAndServeTLS("", ""); err != nil {
+		log.Fatalf("[ATTESTOR] server: %v", err)
+	}
 
 }

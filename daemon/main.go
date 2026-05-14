@@ -12,43 +12,38 @@ import (
 	"time"
 	"crypto/tls"
     "crypto/x509"
-	"github.com/google/go-tpm/tpm2"
 )
 
 const (
 	AUDIT_EVENT_HEARTBEAT = 10
 	AUDIT_EVENT_BATCH_ANCHOR = 6
-	RECORD_SIZE           = 168
+	RECORD_SIZE           = 152
 	ATTESTOR_URL          = "http://127.0.0.1:9000/ingest"
 	DEVICE                = "/dev/bpfaudit"
 )
 
 type AuditRecord struct {
-	Seq         uint64
-	TimestampNs uint64
-	PrevHash    uint64
-	CurrHash    uint64
-	Pid         uint32
-	Tgid        uint32
-	Uid         uint32
-	Gid         uint32
-	CgroupId    uint64
-	PidNsId     uint64
-	ProgId      uint32
-	ProgType    uint32
-	EventType   uint8
-	Source      uint8
-	Pad         [6]uint8
-	ProgTag     [8]uint8
-	Comm        [16]byte
-	Path        [64]byte
+    Seq         uint64
+    TimestampNs uint64
+    EventType   uint8
+    Source      uint8
+    Pad         [6]uint8   
+    Pid         uint32
+    Tgid        uint32
+    Uid         uint32
+    Gid         uint32
+    CgroupId    uint64
+    PidNsId     uint64
+    ProgId      uint32
+    ProgType    uint32
+    ProgTag     [8]uint8
+    Comm        [16]byte
+    Path        [64]byte
 }
 
 type WireRecord struct {
 	Seq         uint64 `json:"seq"`
 	TimestampNs uint64 `json:"timestamp_ns"`
-	PrevHash    uint64 `json:"prev_hash"`
-	CurrHash    uint64 `json:"curr_hash"`
 	Pid         uint32 `json:"pid"`
 	Tgid        uint32 `json:"tgid"`
 	Uid         uint32 `json:"uid"`
@@ -75,8 +70,6 @@ func toWire(r *AuditRecord) WireRecord {
 	return WireRecord{
 		Seq:         r.Seq,
 		TimestampNs: r.TimestampNs,
-		PrevHash:    r.PrevHash,
-		CurrHash:    r.CurrHash,
 		Pid:         r.Pid,
 		Tgid:        r.Tgid,
 		Uid:         r.Uid,
@@ -102,22 +95,6 @@ func nullStr(b []byte) string {
 	return string(b)
 }
 
-
-
-func getQuote(nonce []byte) ([]byte, error) {
-    rwc, err := tpm2.OpenTPM("/dev/tpmrm0")
-    if err != nil { return nil, err }
-    defer rwc.Close()
-
-    pcrSel := tpm2.PCRSelection{
-        Hash: tpm2.AlgSHA256,
-        PCRs: []int{23},
-    }
-    quote, _, err := tpm2.Quote(rwc, 
-        tpm2.HandleEndorsement, 
-        "", "", nonce, pcrSel, tpm2.AlgNull)
-    return quote, err
-}
 
 
 /*------- mTLS ------- */
@@ -195,28 +172,29 @@ func main() {
 			continue
 		}
 
-		var rec AuditRecord
-		if err := binary.Read(bytes.NewReader(rawBuf), binary.LittleEndian, &rec); err != nil {
-			log.Printf("[DAEMON] decode error: %v", err)
-			continue
-		}
+		eventType := rawBuf[16]
 
 		// chech if HEARTBEAT
-		if rec.EventType == AUDIT_EVENT_HEARTBEAT {
+		if eventType == AUDIT_EVENT_HEARTBEAT {
+			var rec AuditRecord
+			if err := binary.Read(bytes.NewReader(rawBuf), binary.LittleEndian, &rec); 
+			   err != nil {
+				log.Printf("[DAEMON] decode error: %v", err)
+				continue
+			}
 			send(Batch{IsHeartbeat: true, Records: []WireRecord{toWire(&rec)}})
 			continue
 		}
 
-		if rec.EventType == AUDIT_EVENT_BATCH_ANCHOR {
-            /* path[0:32] = batch_hash, path[32:64] = hmac tag */
-			log.Printf("[DAEMON] anchor hash=%x", rec.Path[0:32])
-    		log.Printf("[DAEMON] anchor sig=%x", rec.Path[32:64])
-			log.Printf("[DAEMON] anchor received, pendingRecords count=%d", len(pendingRecords))
-            kernelHash := fmt.Sprintf("%x", rec.Path[0:32])
-            sig        := fmt.Sprintf("%x", rec.Path[32:64])
-			endSeq := uint64(rec.ProgType)<<32 | uint64(rec.ProgId)
+		if eventType == AUDIT_EVENT_BATCH_ANCHOR {
+			endSeq     := binary.LittleEndian.Uint64(rawBuf[24:32])
+			kernelHash := fmt.Sprintf("%x", rawBuf[32:64])
+			sig        := fmt.Sprintf("%x", rawBuf[64:96])
 			split := 0
-			
+
+			log.Printf("[DAEMON] anchor endSeq=%d hash=%s sig=%s", endSeq, kernelHash, sig)
+			log.Printf("[DAEMON] anchor received, pendingRecords=%d", len(pendingRecords))
+
 			for i, wr := range pendingRecords {
         		if wr.Seq > endSeq {
             		break
@@ -239,7 +217,12 @@ func main() {
 			}
             continue
 		}
-
+		// regular event 
+		var rec AuditRecord
+		if err := binary.Read(bytes.NewReader(rawBuf), binary.LittleEndian, &rec); err != nil {
+			log.Printf("[DAEMON] decode error: %v", err)
+			continue
+		}
 		pendingRecords = append(pendingRecords, toWire(&rec))
 	}
 }
