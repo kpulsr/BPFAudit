@@ -186,16 +186,16 @@ int bpfaudit_heartbeat_init(struct bpf_ring_ctx *ctx) {
   int ret; 
   g_ctx = ctx;
 
-  hrtimer_setup(&hb_timer, hb_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-  hrtimer_start(&hb_timer, ktime_set(HEARTBEAT_INTERVAL_S, 0),
-                HRTIMER_MODE_REL);
-  pr_info("heartbeat started (interval=%ds)\n", HEARTBEAT_INTERVAL_S);
-
   ret = fetch_hmac_key();
   if (ret) {
     pr_err("failed to fetch HMAC key from keyring: %d\n", ret);
     return ret;
-  }  
+  }
+
+  hrtimer_setup(&hb_timer, hb_fn, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+  hrtimer_start(&hb_timer, ktime_set(HEARTBEAT_INTERVAL_S, 0),
+                HRTIMER_MODE_REL);
+  pr_info("heartbeat started (interval=%ds)\n", HEARTBEAT_INTERVAL_S);
 
   return 0;    
 }

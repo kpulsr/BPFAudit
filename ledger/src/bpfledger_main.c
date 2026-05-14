@@ -29,6 +29,8 @@
 #include <linux/sysfs.h>
 #include <linux/perf_event.h>
 #include <linux/hex.h>
+#include <net/sock.h>
+#include <linux/filter.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Meriah Ibrahim Abderrahim");
@@ -72,19 +74,19 @@ static struct device *bpfaudit_dev;
 static void fill_process_ctx(struct audit_record *rec) {
   struct css_set *css; 
 
-  rec->pid = (u32)current->pid;
-  rec->tgid = (u32)current->tgid;
-  rec->uid = from_kuid(&init_user_ns, current_uid());
-  rec->gid = from_kgid(&init_user_ns, current_gid());
+  rec->u.ev.pid = (u32)current->pid;
+  rec->u.ev.tgid = (u32)current->tgid;
+  rec->u.ev.uid = from_kuid(&init_user_ns, current_uid());
+  rec->u.ev.gid = from_kgid(&init_user_ns, current_gid());
 
   if (task_active_pid_ns(current))
-    rec->pid_ns_id = task_active_pid_ns(current)->ns.inum;
+    rec->u.ev.pid_ns_id = task_active_pid_ns(current)->ns.inum;
 
   css = task_css_set(current);
   if (css && css->dfl_cgrp)
-      rec->cgroup_id = (u64)cgroup_ino(css->dfl_cgrp); 
+      rec->u.ev.cgroup_id = (u64)cgroup_ino(css->dfl_cgrp); 
   else
-      rec->cgroup_id = 0; 
+      rec->u.ev.cgroup_id = 0; 
 }
 
 /**
@@ -125,11 +127,10 @@ static void native_submit_event(struct audit_record *rec) {
         anchor.event_type   = AUDIT_EVENT_BATCH_ANCHOR;
         anchor.timestamp_ns = ktime_get_ns();
 
-        anchor.prog_id      = (u32)end_seq;
-        anchor.prog_type    = (u32)(end_seq >> 32);
+        anchor.u.anr.end_seq = end_seq;
 
-        memcpy(anchor.path,      recc->hash,      32);
-        memcpy(anchor.path + 32, recc->signature, 32);
+        memcpy(anchor.u.anr.batch_hash,      recc->hash,      32);
+        memcpy(anchor.u.anr.batch_hmac, recc->signature, 32);
         kfree(recc);
 
         spin_lock_irqsave(&anchor_lock, aflags);
@@ -181,10 +182,9 @@ static void flush_partial_batch(void)
         memset(&anchor, 0, sizeof(anchor));
         anchor.event_type   = AUDIT_EVENT_BATCH_ANCHOR;
         anchor.timestamp_ns = ktime_get_ns();
-        anchor.prog_id      = (u32)end_seq;        
-        anchor.prog_type    = (u32)(end_seq >> 32);
-        memcpy(anchor.path,      recc->hash,      32);
-        memcpy(anchor.path + 32, recc->signature, 32);
+        anchor.u.anr.end_seq = end_seq; 
+        memcpy(anchor.u.anr.batch_hash,      recc->hash,      32);
+        memcpy(anchor.u.anr.batch_hmac, recc->signature, 32);
         kfree(recc);
 
         spin_lock_irqsave(&anchor_lock, aflags);
@@ -349,21 +349,56 @@ static bool is_feature_probe(struct bpf_prog *prog)
     return false;
 }
 
+
+static void emit_prog_event(struct bpf_prog *prog, u8 event_type, u8 source)
+{
+  struct audit_record rec;
+  memset(&rec, 0, sizeof(rec));
+  get_task_comm(rec.u.ev.comm, current);
+  fill_process_ctx(&rec);
+  rec.event_type = event_type;
+  rec.source     = source;
+  rec.u.ev.prog_id    = prog->aux->id ? prog->aux->id : 0;
+  rec.u.ev.prog_type  = prog->type;
+  memcpy(rec.u.ev.prog_tag, prog->tag, 8);
+  native_submit_event(&rec);
+}
+
+
 /* ----------------------------  Fprobe  --------------------------*/
 /* BPF program lifecycle hooks... Full Chain
  * Execution order (chronological):
- *      1. bpf_prog_new_fd: Post-load, pre-attach: FD created, program exists in
- * kernel
- *      2. bpf_link_init: Pre-attach: link structure initializing
- *      3. perf_event_set_bpf_prog: Post-attach: program hooked to perf
- * event/trigger
- *      4. bpf_obj_pin_user: Optional post-attach: program pinned to FS for
- * persistence
- *      5. bpf_link_free: Pre-detach: link tearing down, program deactivating
- *      6. bpf_prog_release: fires when the process close the FD before defer work to 
- *workthread
- *      7. bpf_prog_put_deferred: Post-detach, pre-free: reference dropped
+ * LOAD:
+ *   1. bpf_prog_new_fd        — post-verifier, FD created, prog live in kernel
+ *
+ * ATTACH (one of, depending on path):
+ *   2a. bpf_link_settle       — BPF_LINK_CREATE path (fentry/fexit/LSM/XDP/TC/cgroup-link/...)
+ *   2b. perf_event_set_bpf_prog — perf ioctl path (kprobe/uprobe/tracepoint via ioctl)
+ *   2c. __cgroup_bpf_attach   — BPF_PROG_ATTACH legacy path (cgroup types)
+ *   2d. bpf_probe_register    — BPF_RAW_TRACEPOINT_OPEN path (raw_tp programs)
+ *
+ * PIN (optional):
+ *   3.  bpf_obj_pin_user      — program pinned to /sys/fs/bpf/ for persistence
+ *
+ * DETACH (mirrors attach path):
+ *   4a. bpf_link_free         — BPF_LINK_CREATE path (skips PERF_EVENT type)
+ *   4b. perf_event_detach_bpf_prog — perf path (both ioctl and link flavor)
+ *   4c. __cgroup_bpf_detach   — BPF_PROG_ATTACH legacy path
+ *   4d. bpf_probe_unregister  — BPF_RAW_TRACEPOINT_OPEN path
+ *
+ * CLOSE:
+ *   5.  bpf_prog_release      — prog FD closed, still in process context
+ *
+ * FREE:
+ *   6.  bpf_prog_put_deferred — refcount zero, runs in kworker, memory about to be released
+ *
  * Covers: LOAD -> ATTACH -> (PIN) -> DETACH -> CLOSE -> MEMFREE
+ *
+ * Known limitations (future work):
+ *   - BPF_PROG_ATTACH sockmap path  (sock_map_prog_update)
+ *   - BPF_PROG_ATTACH flow dissector (skb_flow_dissector_bpf_prog_attach)
+ *   - setsockopt SO_ATTACH_BPF      (sk_attach_bpf)
+ *   - netlink TC/XDP/LWT attach     (cls_bpf_change / dev_change_xdp_fd / bpf_build_state)
  */
 
 
@@ -379,23 +414,13 @@ static int fp_bpf_prog_new_fd(struct fprobe *fp, unsigned long ip, unsigned long
 
   struct bpf_prog *prog = (struct bpf_prog *)ftrace_regs_get_argument(fregs,0);
   if (prog && prog->aux && prog->aux->id > 0) {
-
     if (is_feature_probe(prog)) return 0;
-
-    struct audit_record rec;
-    memset(&rec, 0, sizeof(rec));
-    get_task_comm(rec.comm, current);
-    fill_process_ctx(&rec);
-    rec.event_type = AUDIT_EVENT_LOAD;
-    rec.source = AUDIT_SOURCE_FPROBE;
-    rec.prog_id = prog->aux->id;
-    rec.prog_type = prog->type;
-    memcpy(rec.prog_tag, prog->tag, 8);
-    native_submit_event(&rec);
+    emit_prog_event(prog, AUDIT_EVENT_LOAD, AUDIT_SOURCE_FPROBE);
   }
   return 0;
 }
 static struct fprobe fps_bpf_prog_new_fd = {.entry_handler = fp_bpf_prog_new_fd};
+
 
 /**
  * fp_bpf_link_settle - capture BPF program attachment via modern link API
@@ -403,34 +428,27 @@ static struct fprobe fps_bpf_prog_new_fd = {.entry_handler = fp_bpf_prog_new_fd}
  * Fires only after successful attach, if attach fails, cleanup runs instead
  * Extracts prog metadata from primer->link->prog and emits AUDIT_EVENT_ATTACH.
  */
-
 static int fp_bpf_link_settle(struct fprobe *fp, unsigned long ip,
     unsigned long ret_ip, struct ftrace_regs *fregs, void *data) {
 
   struct bpf_link_primer *primer =
         (struct bpf_link_primer *)ftrace_regs_get_argument(fregs, 0);
 
+  if(!primer)
+      return 0; 
+
   struct bpf_prog *prog; 
   if (!primer->link || !primer->link->prog || !primer->link->prog->aux)
      return 0; 
 
   prog = primer->link->prog;
-
-  struct audit_record rec;
-  memset(&rec, 0, sizeof(rec));
-  get_task_comm(rec.comm, current);
-  fill_process_ctx(&rec);
-  rec.event_type = AUDIT_EVENT_ATTACH;
-  rec.source = AUDIT_SOURCE_FPROBE;
-  rec.prog_id = prog->aux->id;
-  rec.prog_type = prog->type;
-  memcpy(rec.prog_tag, prog->tag, 8);
-  native_submit_event(&rec);
+  emit_prog_event(prog, AUDIT_EVENT_ATTACH, AUDIT_SOURCE_FPROBE);
   return 0;
 }
 static struct fprobe fps_bpf_link_settle = {
     .entry_handler = fp_bpf_link_settle,
 };
+
 
 /**
  * fp_bpf_link_free, Capture DETACH for non-perf link types
@@ -445,24 +463,15 @@ static int fp_bpf_link_free(struct fprobe *fp, unsigned long ip,
  
   if (link->type == BPF_LINK_TYPE_PERF_EVENT)
     return 0;
-
-  pr_info("non perf-event"); 
+ 
   if (link && link->prog && link->prog->aux) {
-    struct audit_record rec;
-    memset(&rec, 0, sizeof(rec));
-    get_task_comm(rec.comm, current);
-    fill_process_ctx(&rec);
-    rec.event_type = AUDIT_EVENT_DETACH;
-    rec.source = AUDIT_SOURCE_FPROBE;
-    rec.prog_id = link->prog->aux->id;
-    rec.prog_type = link->prog->type;
-    memcpy(rec.prog_tag, link->prog->tag, 8);
-    native_submit_event(&rec);
+    emit_prog_event(link->prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_FPROBE);
   }
   return 0;
 }
 
 static struct fprobe fps_bpf_link_free = {.entry_handler = fp_bpf_link_free};
+
 
 /**
  * captures BPF program attachment to perf events
@@ -473,20 +482,12 @@ static int fp_perf_event_set_bpf(struct fprobe *fp, unsigned long ip,
 
   struct bpf_prog *prog = (struct bpf_prog *)ftrace_regs_get_argument(fregs, 1);
   if (prog && prog->aux && prog->aux->id > 0) {
-    struct audit_record rec;
-    memset(&rec, 0, sizeof(rec));
-    get_task_comm(rec.comm, current);
-    fill_process_ctx(&rec);
-    rec.event_type = AUDIT_EVENT_ATTACH;
-    rec.source = AUDIT_SOURCE_FPROBE;
-    rec.prog_id = prog->aux->id;
-    rec.prog_type = prog->type;
-    memcpy(rec.prog_tag, prog->tag, 8);
-    native_submit_event(&rec);
+    emit_prog_event(prog, AUDIT_EVENT_ATTACH, AUDIT_SOURCE_FPROBE);
   }
   return 0;
 }
 static struct fprobe fps_perf_event_set = {.entry_handler = fp_perf_event_set_bpf};
+
 
 /**
  * fp_perf_event_detach_bpf_prog, Capture DETACH for perf events
@@ -497,8 +498,6 @@ static struct fprobe fps_perf_event_set = {.entry_handler = fp_perf_event_set_bp
  */
 static int kp_perf_event_detach_handler(struct kprobe *p, struct pt_regs *regs)
 {
-
-    pr_info("ENTER"); 
     struct perf_event *event = (struct perf_event *)regs_get_kernel_argument(regs, 0);
     
     if (!event || !event->prog || !event->prog->aux)
@@ -508,13 +507,13 @@ static int kp_perf_event_detach_handler(struct kprobe *p, struct pt_regs *regs)
 
     struct audit_record rec;
     memset(&rec, 0, sizeof(rec));
-    get_task_comm(rec.comm, current);
+    get_task_comm(rec.u.ev.comm, current);
     fill_process_ctx(&rec);
     rec.event_type = AUDIT_EVENT_DETACH;
-    rec.source = AUDIT_SOURCE_KPROBE;  // or keep AUDIT_SOURCE_FPROBE if you want
-    rec.prog_id = prog->aux->id;
-    rec.prog_type = prog->type;
-    memcpy(rec.prog_tag, prog->tag, 8);
+    rec.source = AUDIT_SOURCE_KPROBE;
+    rec.u.ev.prog_id = prog->aux->id;
+    rec.u.ev.prog_type = prog->type;
+    memcpy(rec.u.ev.prog_tag, prog->tag, 8);
     native_submit_event(&rec);
     return 0;
 }
@@ -523,6 +522,7 @@ static struct kprobe kp_perf_event_detach = {
     .symbol_name = "perf_event_detach_bpf_prog",
     .pre_handler = kp_perf_event_detach_handler,
 };
+
 
 /**
  * captures BPF object pinning to filesystem
@@ -536,15 +536,15 @@ static int fp_bpf_obj_pin_user(struct fprobe *fp, unsigned long ip,
   long ret;
 
   memset(&rec, 0, sizeof(rec));
-  get_task_comm(rec.comm, current);
+  get_task_comm(rec.u.ev.comm, current);
   fill_process_ctx(&rec);
   rec.event_type = AUDIT_EVENT_PIN;
   rec.source = AUDIT_SOURCE_FPROBE;
 
   pathname = (char __user *)ftrace_regs_get_argument(fregs, 1);
-  ret = strncpy_from_user(rec.path, pathname, sizeof(rec.path) - 1);
+  ret = strncpy_from_user(rec.u.ev.path, pathname, sizeof(rec.u.ev.path) - 1);
   if (ret < 0)
-     rec.path[0] = '\0'; 
+     rec.u.ev.path[0] = '\0'; 
 
   native_submit_event(&rec);
   return 0;
@@ -553,7 +553,6 @@ static struct fprobe fps_bpf_obj_pin_user = {.entry_handler = fp_bpf_obj_pin_use
 
 
 /**/
-
 static int fp_cgroup_bpf_attach(struct fprobe *fp, unsigned long ip,
     unsigned long ret_ip, struct ftrace_regs *fregs, void *data)
 {
@@ -563,22 +562,13 @@ static int fp_cgroup_bpf_attach(struct fprobe *fp, unsigned long ip,
     if (!prog || !prog->aux || !prog->aux->id) return 0;
     if (is_feature_probe(prog)) return 0;
 
-    struct audit_record rec;
-    memset(&rec, 0, sizeof(rec));
-    get_task_comm(rec.comm, current);
-    fill_process_ctx(&rec);
-    rec.event_type = AUDIT_EVENT_ATTACH;
-    rec.source     = AUDIT_SOURCE_FPROBE;
-    rec.prog_id    = prog->aux->id;
-    rec.prog_type  = prog->type;
-    memcpy(rec.prog_tag, prog->tag, 8);
-    native_submit_event(&rec);
+    emit_prog_event(prog, AUDIT_EVENT_ATTACH, AUDIT_SOURCE_FPROBE);
     return 0;
 }
 static struct fprobe fps_cgroup_bpf_attach = {.entry_handler = fp_cgroup_bpf_attach};
 
-/**/
 
+/**/
 static int fp_cgroup_bpf_detach(struct fprobe *fp, unsigned long ip,
     unsigned long ret_ip, struct ftrace_regs *fregs, void *data)
 {
@@ -587,19 +577,47 @@ static int fp_cgroup_bpf_detach(struct fprobe *fp, unsigned long ip,
     struct bpf_prog *prog = (struct bpf_prog *)ftrace_regs_get_argument(fregs, 1);
     if (!prog || !prog->aux || !prog->aux->id) return 0;
 
-    struct audit_record rec;
-    memset(&rec, 0, sizeof(rec));
-    get_task_comm(rec.comm, current);
-    fill_process_ctx(&rec);
-    rec.event_type = AUDIT_EVENT_DETACH;
-    rec.source     = AUDIT_SOURCE_FPROBE;
-    rec.prog_id    = prog->aux->id;
-    rec.prog_type  = prog->type;
-    memcpy(rec.prog_tag, prog->tag, 8);
-    native_submit_event(&rec);
+    emit_prog_event(prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_FPROBE);
     return 0;
 }
 static struct fprobe fps_cgroup_bpf_detach = {.entry_handler = fp_cgroup_bpf_detach};
+
+
+/**
+ * kp_bpf_probe_register - capture RAW_TRACEPOINT program attach
+ * Hooks bpf_probe_register(), called by bpf_raw_tracepoint_open()
+ * when a BPF_RAW_TRACEPOINT_OPEN cmd activates a raw_tp program.
+ */
+static int kp_bpf_probe_register_handler(struct kprobe *p, struct pt_regs *regs)
+{
+  struct bpf_prog *prog = (struct bpf_prog *)regs_get_kernel_argument(regs, 1);
+  if (!prog || !prog->aux || !prog->aux->id) return 0;
+  if (is_feature_probe(prog)) return 0;
+  emit_prog_event(prog, AUDIT_EVENT_ATTACH, AUDIT_SOURCE_KPROBE);
+  return 0;
+}
+static struct kprobe kp_bpf_probe_register = {
+  .symbol_name = "bpf_probe_register",
+  .pre_handler = kp_bpf_probe_register_handler,
+};
+
+
+/**
+ * kp_bpf_probe_unregister - capture RAW_TRACEPOINT program detach
+ * Hooks bpf_probe_unregister(), called when the anonymous raw_tp fd
+ * is closed
+ */
+static int kp_bpf_probe_unregister_handler(struct kprobe *p, struct pt_regs *regs)
+{
+  struct bpf_prog *prog = (struct bpf_prog *)regs_get_kernel_argument(regs, 1);
+  if (!prog || !prog->aux || !prog->aux->id) return 0;
+  emit_prog_event(prog, AUDIT_EVENT_DETACH,AUDIT_SOURCE_KPROBE);
+  return 0;
+}
+static struct kprobe kp_bpf_probe_unregister = {
+  .symbol_name = "bpf_probe_unregister",
+  .pre_handler = kp_bpf_probe_unregister_handler,
+};
 
 
 /*
@@ -616,17 +634,7 @@ static int fp_bpf_prog_release(struct fprobe *fp, unsigned long ip,
   if (!prog || !prog->aux || !prog->aux->id) return 0;
 
   if (is_feature_probe(prog)) return 0;
-
-  struct audit_record rec;
-  memset(&rec, 0, sizeof(rec));
-  get_task_comm(rec.comm, current);
-  fill_process_ctx(&rec);
-  rec.event_type = AUDIT_EVENT_CLOSE;
-  rec.source = AUDIT_SOURCE_FPROBE;
-  rec.prog_id = prog->aux->id;
-  rec.prog_type = prog->type;
-  memcpy(rec.prog_tag, prog->tag, 8);
-  native_submit_event(&rec);
+  emit_prog_event(prog, AUDIT_EVENT_CLOSE, AUDIT_SOURCE_FPROBE);
   return 0;
 }
 static struct fprobe fps_bpf_prog_release = {
@@ -652,21 +660,90 @@ static int fp_bpf_prog_put_deferred(struct fprobe *fp, unsigned long ip,
     return 0; /* not yet zeroed... zeroed in bpf_prog_free_id */
 
   if (is_feature_probe(prog)) return 0;
-
-  struct audit_record rec;
-  memset(&rec, 0, sizeof(rec));
-  get_task_comm(rec.comm, current);
-  fill_process_ctx(&rec);
-  rec.event_type = AUDIT_EVENT_FREE;
-  rec.source = AUDIT_SOURCE_FPROBE;
-  rec.prog_id = aux->id;
-  rec.prog_type = prog->type;
-  memcpy(rec.prog_tag, prog->tag, 8);
-  native_submit_event(&rec);
+  emit_prog_event(prog, AUDIT_EVENT_FREE,AUDIT_SOURCE_FPROBE);
   return 0;
 }
 
 static struct fprobe fps_bpf_prog_put_deferred = {.entry_handler = fp_bpf_prog_put_deferred};
+
+
+/*============================================================================*/
+/*===============================CLASSIC BPF==================================*/
+
+
+struct cbpf_load_data {
+    struct sock *sk;   /* save socket at entry, read filter at return */
+};
+
+static int krp_cbpf_entry(struct kretprobe_instance *ri,
+                           struct pt_regs *regs)
+{
+    struct cbpf_load_data *d = (struct cbpf_load_data *)ri->data;
+    /* sk_attach_filter(struct sock_fprog *fprog, struct sock *sk)
+     * sk is second argument */
+    d->sk = (struct sock *)regs_get_kernel_argument(regs, 1);
+    pr_info("cbpf sk_attach_filter ENTRY sk=%px\n", d->sk);
+    return 0;
+}
+
+static int krp_cbpf_ret(struct kretprobe_instance *ri,
+                         struct pt_regs *regs)
+{
+    struct cbpf_load_data *d = (struct cbpf_load_data *)ri->data;
+    long retval = regs_return_value(regs);
+    struct sk_filter *f;
+    struct bpf_prog *prog;
+
+    pr_info("cbpf sk_attach_filter RET retval=%ld sk=%px\n", retval, d->sk);
+
+    if (retval != 0 || !d->sk)
+        return 0;
+
+    rcu_read_lock();
+    f = rcu_dereference(d->sk->sk_filter);
+    if (!f || !f->prog) {
+        rcu_read_unlock();
+        return 0;
+    }
+    prog = f->prog;
+    pr_info("cbpf LOAD+ATTACH: prog=%px type=%u\n", prog, prog->type);
+    emit_prog_event(prog, AUDIT_EVENT_LOAD, AUDIT_SOURCE_KPROBE);
+    emit_prog_event(prog, AUDIT_EVENT_ATTACH, AUDIT_SOURCE_KPROBE);
+    rcu_read_unlock();
+    return 0;
+}
+
+static struct kretprobe krp_cbpf_create = {
+    .handler       = krp_cbpf_ret,
+    .entry_handler = krp_cbpf_entry,
+    .data_size     = sizeof(struct cbpf_load_data),
+    .maxactive     = 32,
+    .kp.symbol_name = "sk_attach_filter",  /* ← direct SO_ATTACH_FILTER path */
+};
+/*===========================================================================*/
+
+static int kp_sk_filter_release_rcu_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    struct rcu_head *rcu = (struct rcu_head *)regs_get_kernel_argument(regs, 0);
+    struct sk_filter *fp;
+    struct bpf_prog *prog;
+
+    if (!rcu) return 0;
+
+    fp = container_of(rcu, struct sk_filter, rcu);
+    if (!fp || !fp->prog) return 0;
+
+    prog = fp->prog;
+    pr_info("cbpf FREE via release_rcu: prog=%px type=%u\n", prog, prog->type);
+    emit_prog_event(prog, AUDIT_EVENT_DETACH,AUDIT_SOURCE_KPROBE);
+    emit_prog_event(prog, AUDIT_EVENT_FREE, AUDIT_SOURCE_KPROBE);
+    return 0;
+}
+
+static struct kprobe kp_cbpf_destroy = {
+    .symbol_name = "sk_filter_release_rcu",  // ← was sk_detach_filter
+    .pre_handler = kp_sk_filter_release_rcu_handler,
+};
 
 /* ------------------------- Character Device -------------------------------*/
 
@@ -833,6 +910,8 @@ static int __init bpfledger_init(void) {
   register_fprobe(&fps_bpf_prog_new_fd,"bpf_prog_new_fd",NULL);
   register_fprobe(&fps_bpf_link_settle,"bpf_link_settle", NULL);
   register_fprobe(&fps_bpf_link_free,"bpf_link_free", NULL);
+  register_kprobe(&kp_bpf_probe_register);
+  register_kprobe(&kp_bpf_probe_unregister);
   ret = register_kprobe(&kp_perf_event_detach);
   if (ret) {
     pr_err("bpfledger: perf_event_detach_bpf_prog fprobe failed: %d\n", ret);
@@ -843,6 +922,13 @@ static int __init bpfledger_init(void) {
     pr_err("bpfledger: perf_event_set_bpf_prog fprobe failed: %d\n", ret);
     goto err_fprobes;
   }
+  ret = register_kretprobe(&krp_cbpf_create);
+  if (ret)
+    pr_err("bpfledger: bpf_prog_create_from_user kretprobe failed: %d\n", ret);
+
+  ret = register_kprobe(&kp_cbpf_destroy);
+  if (ret)
+    pr_err("bpfledger: bpf_prog_destroy kprobe failed: %d\n", ret);
   register_fprobe(&fps_cgroup_bpf_attach, "__cgroup_bpf_attach", NULL);
   register_fprobe(&fps_cgroup_bpf_detach, "__cgroup_bpf_detach", NULL);
   register_fprobe(&fps_bpf_obj_pin_user,"bpf_obj_pin_user", NULL);
@@ -877,8 +963,12 @@ static void __exit bpfledger_exit(void) {
   unregister_fprobe(&fps_bpf_obj_pin_user);
   unregister_fprobe(&fps_cgroup_bpf_attach);
   unregister_fprobe(&fps_cgroup_bpf_detach);
+  unregister_kretprobe(&krp_cbpf_create);
+  unregister_kprobe(&kp_cbpf_destroy);
   unregister_fprobe(&fps_perf_event_set);
   unregister_kprobe(&kp_perf_event_detach);
+  unregister_kprobe(&kp_bpf_probe_register); 
+  unregister_kprobe(&kp_bpf_probe_unregister);
   unregister_fprobe(&fps_bpf_link_free);
   unregister_fprobe(&fps_bpf_link_settle);
   unregister_fprobe(&fps_bpf_prog_new_fd);
