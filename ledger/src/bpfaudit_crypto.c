@@ -2,6 +2,7 @@
 
 #include "linux/compiler.h"
 #include "linux/spinlock.h"
+#include "linux/stddef.h"
 #define pr_fmt(fmt) KBUILD_MODNAME "/crypto: " fmt
 
 #include "bpfaudit_crypto.h"
@@ -68,8 +69,8 @@ void bpfaudit_crypto_zeroize(void) {
   unsigned long flags;
   spin_lock_irqsave(&key_lock, flags);
   memzero_explicit(K_current, HMAC_KEY_SIZE);
-  spin_unlock_irqrestore(&key_lock, flags);
   K_ready = false;
+  spin_unlock_irqrestore(&key_lock, flags);
 }
 
 /* ----------------------------- Signing -----------------------------------*/
