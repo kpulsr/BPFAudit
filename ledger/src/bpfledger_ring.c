@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "linux/compiler.h"
 #define pr_fmt(fmt) KBUILD_MODNAME "/ring: " fmt
 
 #include "bpfledger_ring.h"
@@ -42,6 +41,25 @@ int bpfledger_ring_init(void) {
 
 void bpfledger_ring_exit(void) { vfree(ring); }
 
+/*-------------------------------- Helpers ----------------------------------*/
+static void push_anchor(u64 end_seq, struct batch_crypto_record *recc) {
+  struct audit_record anchor;
+  unsigned long aflags;
+
+  memset(&anchor, 0, sizeof(anchor));
+  anchor.event_type = AUDIT_EVENT_BATCH_ANCHOR;
+  anchor.timestamp_ns = ktime_get_ns();
+  anchor.u.anr.end_seq = end_seq;
+  memcpy(anchor.u.anr.batch_hash, recc->hash, BATCH_HASH_SIZE);
+  memcpy(anchor.u.anr.batch_hmac, recc->signature, BATCH_HASH_SIZE);
+  kfree(recc);
+
+  spin_lock_irqsave(&anchor_lock, aflags);
+  anchor_fifo[anchor_head & ANCHOR_FIFO_MASK] = anchor;
+  anchor_head++;
+  spin_unlock_irqrestore(&anchor_lock, aflags);
+}
+
 /* ----------------------------- Core Logic --------------------------------*/
 
 void native_submit_event(struct audit_record *rec) {
@@ -69,27 +87,10 @@ void native_submit_event(struct audit_record *rec) {
 
   if (do_flush) {
     struct batch_crypto_record *recc = batch_hash_sign(flush_batch, BATCH_SIZE);
-    if (likely(!IS_ERR(recc))) {
-      struct audit_record anchor;
-      unsigned long aflags;
-      u64 end_seq = flush_batch[BATCH_SIZE - 1].seq;
-      memset(&anchor, 0, sizeof(anchor));
-      anchor.event_type = AUDIT_EVENT_BATCH_ANCHOR;
-      anchor.timestamp_ns = ktime_get_ns();
-
-      anchor.u.anr.end_seq = end_seq;
-
-      memcpy(anchor.u.anr.batch_hash, recc->hash, 32);
-      memcpy(anchor.u.anr.batch_hmac, recc->signature, 32);
-      kfree(recc);
-
-      spin_lock_irqsave(&anchor_lock, aflags);
-      anchor_fifo[anchor_head & ANCHOR_FIFO_MASK] = anchor;
-      anchor_head++;
-      spin_unlock_irqrestore(&anchor_lock, aflags);
-    } else {
+    if (likely(!IS_ERR(recc)))
+      push_anchor(flush_batch[BATCH_SIZE - 1].seq, recc);
+    else
       pr_warn("batch_hash_sign failed: %ld\n", PTR_ERR(recc));
-    }
   }
   wake_up_interruptible(&ring_wq);
 }
@@ -121,24 +122,8 @@ void flush_partial_batch(void) {
   struct batch_crypto_record *recc = batch_hash_sign(batch_copy, count);
   u64 end_seq = batch_copy[count - 1].seq;
   kfree(batch_copy);
-
-  if (likely(!IS_ERR(recc))) {
-    struct audit_record anchor;
-
-    memset(&anchor, 0, sizeof(anchor));
-    anchor.event_type = AUDIT_EVENT_BATCH_ANCHOR;
-    anchor.timestamp_ns = ktime_get_ns();
-    anchor.u.anr.end_seq = end_seq;
-    memcpy(anchor.u.anr.batch_hash, recc->hash, 32);
-    memcpy(anchor.u.anr.batch_hmac, recc->signature, 32);
-    kfree(recc);
-
-    spin_lock_irqsave(&anchor_lock, aflags);
-    anchor_fifo[anchor_head & ANCHOR_FIFO_MASK] = anchor;
-    anchor_head++;
-    spin_unlock_irqrestore(&anchor_lock, aflags);
-    wake_up_interruptible(&ring_wq);
-  } else {
+  if (likely(!IS_ERR(recc)))
+    push_anchor(end_seq, recc);
+  else
     pr_warn("flush_partial: batch_hash_sign failed: %ld\n", PTR_ERR(recc));
-  }
 }

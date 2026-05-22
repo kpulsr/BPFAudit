@@ -3,7 +3,6 @@
  * bpfledger.c — Native LKM append-only eBPF lifecycle ledger
  */
 
-#include "linux/compiler.h"
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "bpfaudit_heartbeat.h"
@@ -25,7 +24,6 @@
 #include <linux/nsproxy.h>
 #include <linux/perf_event.h>
 #include <linux/pid_namespace.h>
-#include <linux/poll.h>
 #include <linux/ptrace.h>
 #include <linux/random.h>
 #include <linux/slab.h>
@@ -36,8 +34,9 @@
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Meriah Ibrahim Abderrahim");
-MODULE_DESCRIPTION("Native BPF Ledger (Cryptographic, Container-Aware)");
-MODULE_VERSION("6.0-FINAL");
+MODULE_DESCRIPTION(
+    "bpfledger: cryptographic eBPF lifecycle auditing with container context");
+MODULE_VERSION("0.1.0");
 
 /* --------------------------- Init Flags ----------------------------------*/
 /*
@@ -76,16 +75,6 @@ static struct bpf_ring_ctx hb_ctx = {
     .flush_partial = flush_partial_batch,
 };
 
-/*-------------------- Generic Direct prog-arg Context -------------------- */
-
-static struct bpf_fprobe_ctx {
-    struct fprobe fp; 
-    int arg_idx; 
-    u8 event_type; 
-    bool filter_probes; 
-}; 
-
-
 /* ----------------------------- Helpers -----------------------------------*/
 /**
  * fill_process_ctx - populate process and namespace identity fields in an audit
@@ -123,9 +112,6 @@ static bool is_feature_probe(struct bpf_prog *prog) {
 
   if (unlikely(!prog || !prog->aux))
     return false;
-
-  /* pr_info("bpfledger probe_check: id=%u type=%u len=%u map_cnt=%u\n",
-           prog->aux->id, prog->type, prog->len, prog->aux->used_map_cnt); */
 
   /* programs using 2+ maps are real programs ! not probes based on search in
    * libbpf
@@ -254,8 +240,6 @@ static bool is_feature_probe(struct bpf_prog *prog) {
       return true;
   }
 
-  pr_info("bpfledger probe_check: id=%u type=%u len=%u map_cnt=%u\n",
-          prog->aux->id, prog->type, prog->len, prog->aux->used_map_cnt);
   return false;
 }
 
@@ -373,10 +357,9 @@ static int fp_bpf_link_free(struct fprobe *fp, unsigned long ip,
                             void *data) {
   struct bpf_link *link = (struct bpf_link *)ftrace_regs_get_argument(fregs, 0);
 
-  if (link->type == BPF_LINK_TYPE_PERF_EVENT)
-    return 0;
-
   if (likely(link && link->prog && link->prog->aux)) {
+    if (link->type == BPF_LINK_TYPE_PERF_EVENT)
+      return 0;
     emit_prog_event(link->prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_FPROBE);
   }
   return 0;
@@ -408,13 +391,14 @@ static struct fprobe fps_perf_event_set = {.entry_handler =
  * no bpf_link) and modern perf attach (BPF_LINK_TYPE_PERF_EVENT,
  * via bpf_perf_link_release -> perf_event_free_bpf_prog)
  */
-static int kp_perf_event_detach_handler(struct kprobe *p, struct pt_regs *regs)
-{
-    struct perf_event *event = (struct perf_event *)regs_get_kernel_argument(regs, 0);
-    if (unlikely(!event || !event->prog || !event->prog->aux))
-        return 0;
-    emit_prog_event(event->prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_KPROBE);
+static int kp_perf_event_detach_handler(struct kprobe *p,
+                                        struct pt_regs *regs) {
+  struct perf_event *event =
+      (struct perf_event *)regs_get_kernel_argument(regs, 0);
+  if (unlikely(!event || !event->prog || !event->prog->aux))
     return 0;
+  emit_prog_event(event->prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_KPROBE);
+  return 0;
 }
 
 static struct kprobe kp_perf_event_detach = {
@@ -595,7 +579,6 @@ static int krp_cbpf_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
   /* sk_attach_filter(struct sock_fprog *fprog, struct sock *sk)
    * sk is second argument */
   d->sk = (struct sock *)regs_get_kernel_argument(regs, 1);
-  pr_info("cbpf sk_attach_filter ENTRY sk=%px\n", d->sk);
   return 0;
 }
 
@@ -604,8 +587,6 @@ static int krp_cbpf_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
   long retval = regs_return_value(regs);
   struct sk_filter *f;
   struct bpf_prog *prog;
-
-  pr_info("cbpf sk_attach_filter RET retval=%ld sk=%px\n", retval, d->sk);
 
   if (unlikely(retval != 0 || !d->sk))
     return 0;
@@ -617,7 +598,6 @@ static int krp_cbpf_ret(struct kretprobe_instance *ri, struct pt_regs *regs) {
     return 0;
   }
   prog = f->prog;
-  pr_info("cbpf LOAD+ATTACH: prog=%px type=%u\n", prog, prog->type);
   emit_prog_event(prog, AUDIT_EVENT_LOAD, AUDIT_SOURCE_KPROBE);
   emit_prog_event(prog, AUDIT_EVENT_ATTACH, AUDIT_SOURCE_KPROBE);
   rcu_read_unlock();
@@ -647,7 +627,6 @@ static int kp_sk_filter_release_rcu_handler(struct kprobe *p,
     return 0;
 
   prog = fp->prog;
-  pr_info("cbpf FREE via release_rcu: prog=%px type=%u\n", prog, prog->type);
   emit_prog_event(prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_KPROBE);
   emit_prog_event(prog, AUDIT_EVENT_FREE, AUDIT_SOURCE_KPROBE);
   return 0;
@@ -760,28 +739,11 @@ retry:
   goto retry;
 }
 
-static __poll_t bpfledger_poll(struct file *file, poll_table *wait) {
-  struct reader_state *rs = file->private_data;
-  poll_wait(file, &ring_wq, wait);
-
-  if (atomic_read(&hb_avail))
-    return EPOLLIN | EPOLLRDNORM;
-
-  spin_lock_irq(&ring_lock);
-  if (rs->pos < ring_head) {
-    spin_unlock_irq(&ring_lock);
-    return EPOLLIN | EPOLLRDNORM;
-  }
-  spin_unlock_irq(&ring_lock);
-  return 0;
-}
-
 static const struct file_operations bpfledger_fops = {
     .owner = THIS_MODULE,
     .open = bpfledger_open,
     .release = bpfledger_release,
     .read = bpfledger_read,
-    .poll = bpfledger_poll,
 };
 
 /* ----------------------------- init/exit -----------------------------------*/
@@ -982,7 +944,6 @@ static int __init bpfledger_init(void) {
   }
   init_flags |= FLAG_PROBE_PUT_DEFERRED;
 
-  pr_info("loaded successfully\n");
   return 0;
 
 fail:

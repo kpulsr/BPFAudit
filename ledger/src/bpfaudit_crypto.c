@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
 
-#include "linux/compiler.h"
-#include "linux/spinlock.h"
-#include "linux/stddef.h"
 #define pr_fmt(fmt) KBUILD_MODNAME "/crypto: " fmt
 
 #include "bpfaudit_crypto.h"
@@ -21,6 +18,8 @@ static u8 K_current[HMAC_KEY_SIZE];
 static bool K_ready = false;
 static DEFINE_SPINLOCK(key_lock);
 
+static struct crypto_shash *tfm_hmac;
+static struct crypto_shash *tfm_sha256;
 /* ----------------------------- Key Management ----------------------------*/
 
 /*
@@ -57,12 +56,28 @@ int bpfaudit_set_hmac_key(const u8 *key, size_t len) {
   if (unlikely(len != HMAC_KEY_SIZE))
     return -EINVAL;
 
+  /* allocate TFMs once if not yet done */
+  if (!tfm_hmac) {
+    tfm_hmac = crypto_alloc_shash("hmac(sha256)", 0, 0);
+    if (IS_ERR(tfm_hmac)) {
+      tfm_hmac = NULL;
+      return PTR_ERR(tfm_hmac);
+    }
+  }
+  if (!tfm_sha256) {
+    tfm_sha256 = crypto_alloc_shash("sha256", 0, 0);
+    if (IS_ERR(tfm_sha256)) {
+      tfm_sha256 = NULL;
+      return PTR_ERR(tfm_sha256);
+    }
+  }
+
   spin_lock_irqsave(&key_lock, flags);
   memcpy(K_current, key, HMAC_KEY_SIZE);
   K_ready = true;
   spin_unlock_irqrestore(&key_lock, flags);
   pr_info("HMAC key provisioned\n");
-  return 0;
+  return crypto_shash_setkey(tfm_hmac, key, HMAC_KEY_SIZE);
 }
 
 void bpfaudit_crypto_zeroize(void) {
@@ -71,6 +86,14 @@ void bpfaudit_crypto_zeroize(void) {
   memzero_explicit(K_current, HMAC_KEY_SIZE);
   K_ready = false;
   spin_unlock_irqrestore(&key_lock, flags);
+  if (tfm_hmac) {
+    crypto_free_shash(tfm_hmac);
+    tfm_hmac = NULL;
+  }
+  if (tfm_sha256) {
+    crypto_free_shash(tfm_sha256);
+    tfm_sha256 = NULL;
+  }
 }
 
 /* ----------------------------- Signing -----------------------------------*/
@@ -80,19 +103,10 @@ void bpfaudit_crypto_zeroize(void) {
  * Keeps forward secrecy: compromise of K_n does not reveal K_{n-1} batches.
  */
 static int ratchet_key(void) {
-  struct crypto_shash *tfm;
   u8 K_next[HMAC_KEY_SIZE];
   int ret;
 
-  tfm = crypto_alloc_shash("sha256", 0, 0);
-  if (unlikely(IS_ERR(tfm))) {
-    pr_err("ratchet: sha256 alloc failed\n");
-    return PTR_ERR(tfm);
-  }
-
-  ret = crypto_shash_tfm_digest(tfm, K_current, HMAC_KEY_SIZE, K_next);
-  crypto_free_shash(tfm);
-
+  ret = crypto_shash_tfm_digest(tfm_sha256, K_current, HMAC_KEY_SIZE, K_next);
   if (unlikely(ret)) {
     pr_err("ratchet: key derivation failed: %d — keeping old key\n", ret);
     memzero_explicit(K_next, HMAC_KEY_SIZE);
@@ -102,8 +116,13 @@ static int ratchet_key(void) {
   memzero_explicit(K_current, HMAC_KEY_SIZE);
   memcpy(K_current, K_next, HMAC_KEY_SIZE);
   memzero_explicit(K_next, HMAC_KEY_SIZE);
+
+  /* resync tfm_hmac to the new key */
+  ret = crypto_shash_setkey(tfm_hmac, K_current, HMAC_KEY_SIZE);
+  if (unlikely(ret))
+    pr_err("ratchet: setkey failed: %d\n", ret);
   pr_info("key ratcheted\n");
-  return 0;
+  return ret;
 }
 
 /*
@@ -111,9 +130,7 @@ static int ratchet_key(void) {
  * Returns -ENOKEY if no key has been provisioned yet.
  */
 static int compute_hmac(const u8 *data, size_t len, u8 *hmac_out) {
-  struct crypto_shash *tfm;
   struct shash_desc *desc;
-  u8 local_key[HMAC_KEY_SIZE];
   unsigned long flags;
   int ret;
 
@@ -122,52 +139,28 @@ static int compute_hmac(const u8 *data, size_t len, u8 *hmac_out) {
     spin_unlock_irqrestore(&key_lock, flags);
     return -ENOKEY;
   }
-  memcpy(local_key, K_current, HMAC_KEY_SIZE);
   spin_unlock_irqrestore(&key_lock, flags);
 
-  tfm = crypto_alloc_shash("hmac(sha256)", 0, 0);
-  if (unlikely(IS_ERR(tfm))) {
-    ret = PTR_ERR(tfm);
-    goto out_zeroize;
-  }
+  desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm_hmac), GFP_ATOMIC);
+  if (unlikely(!desc))
+    return -ENOMEM;
 
-  ret = crypto_shash_setkey(tfm, local_key, HMAC_KEY_SIZE);
-  if (unlikely(ret)) {
-    pr_err("compute_hmac: setkey failed: %d\n", ret);
-    goto out_free_tfm;
-  }
-
-  desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_ATOMIC);
-  if (unlikely(!desc)) {
-    ret = -ENOMEM;
-    goto out_free_tfm;
-  }
-  desc->tfm = tfm;
+  desc->tfm = tfm_hmac;
 
   ret = crypto_shash_init(desc);
   if (unlikely(ret))
-    goto out_free_desc;
-
+    goto out;
   ret = crypto_shash_update(desc, data, len);
   if (unlikely(ret))
-    goto out_free_desc;
-
+    goto out;
   ret = crypto_shash_final(desc, hmac_out);
-  if (unlikely(ret))
-    pr_err("compute_hmac: final failed: %d\n", ret);
-
-out_free_desc:
+out:
   kfree(desc);
-out_free_tfm:
-  crypto_free_shash(tfm);
-out_zeroize:
-  memzero_explicit(local_key, HMAC_KEY_SIZE);
   return ret;
 }
 
 struct batch_crypto_record *batch_hash_sign(struct audit_record *batch,
                                             unsigned int count) {
-  struct crypto_shash *tfm;
   struct shash_desc *desc;
   u8 digest[BATCH_HASH_SIZE];
   int ret, i;
@@ -176,18 +169,12 @@ struct batch_crypto_record *batch_hash_sign(struct audit_record *batch,
   if (unlikely(!rec))
     return ERR_PTR(-ENOMEM);
 
-  tfm = crypto_alloc_shash("sha256", 0, 0);
-  if (unlikely(IS_ERR(tfm))) {
-    ret = PTR_ERR(tfm);
-    goto err_free_rec;
-  }
-
-  desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm), GFP_ATOMIC);
+  desc = kmalloc(sizeof(*desc) + crypto_shash_descsize(tfm_sha256), GFP_ATOMIC);
   if (unlikely(!desc)) {
     ret = -ENOMEM;
-    goto err_free_tfm;
+    goto err_free_rec;
   }
-  desc->tfm = tfm;
+  desc->tfm = tfm_sha256;
 
   ret = crypto_shash_init(desc);
   if (unlikely(ret))
@@ -220,13 +207,10 @@ struct batch_crypto_record *batch_hash_sign(struct audit_record *batch,
         ret);
 
   kfree(desc);
-  crypto_free_shash(tfm);
   return rec;
 
 err_free_desc:
   kfree(desc);
-err_free_tfm:
-  crypto_free_shash(tfm);
 err_free_rec:
   kfree(rec);
   return ERR_PTR(ret);
