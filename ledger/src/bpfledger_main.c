@@ -75,6 +75,17 @@ static struct bpf_ring_ctx hb_ctx = {
     .ring_wq = &ring_wq,
     .flush_partial = flush_partial_batch,
 };
+
+/*-------------------- Generic Direct prog-arg Context -------------------- */
+
+static struct bpf_fprobe_ctx {
+    struct fprobe fp; 
+    int arg_idx; 
+    u8 event_type; 
+    bool filter_probes; 
+}; 
+
+
 /* ----------------------------- Helpers -----------------------------------*/
 /**
  * fill_process_ctx - populate process and namespace identity fields in an audit
@@ -397,27 +408,13 @@ static struct fprobe fps_perf_event_set = {.entry_handler =
  * no bpf_link) and modern perf attach (BPF_LINK_TYPE_PERF_EVENT,
  * via bpf_perf_link_release -> perf_event_free_bpf_prog)
  */
-static int kp_perf_event_detach_handler(struct kprobe *p,
-                                        struct pt_regs *regs) {
-  struct perf_event *event =
-      (struct perf_event *)regs_get_kernel_argument(regs, 0);
-
-  if (unlikely(!event || !event->prog || !event->prog->aux))
+static int kp_perf_event_detach_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    struct perf_event *event = (struct perf_event *)regs_get_kernel_argument(regs, 0);
+    if (unlikely(!event || !event->prog || !event->prog->aux))
+        return 0;
+    emit_prog_event(event->prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_KPROBE);
     return 0;
-
-  struct bpf_prog *prog = event->prog;
-
-  struct audit_record rec;
-  memset(&rec, 0, sizeof(rec));
-  get_task_comm(rec.u.ev.comm, current);
-  fill_process_ctx(&rec);
-  rec.event_type = AUDIT_EVENT_DETACH;
-  rec.source = AUDIT_SOURCE_KPROBE;
-  rec.u.ev.prog_id = prog->aux->id;
-  rec.u.ev.prog_type = prog->type;
-  memcpy(rec.u.ev.prog_tag, prog->tag, 8);
-  native_submit_event(&rec);
-  return 0;
 }
 
 static struct kprobe kp_perf_event_detach = {
