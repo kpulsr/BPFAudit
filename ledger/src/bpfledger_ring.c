@@ -58,6 +58,7 @@ static void push_anchor(u64 end_seq, struct batch_crypto_record *recc) {
   anchor_fifo[anchor_head & ANCHOR_FIFO_MASK] = anchor;
   anchor_head++;
   spin_unlock_irqrestore(&anchor_lock, aflags);
+  pr_debug("anchor pushed end_seq=%llu\n", end_seq);
 }
 
 /* ----------------------------- Core Logic --------------------------------*/
@@ -72,6 +73,8 @@ void native_submit_event(struct audit_record *rec) {
   seq = ring_head++;
   rec->seq = seq;
   rec->timestamp_ns = ktime_get_ns();
+
+  pr_debug("event seq=%llu type=%u pid=%u\n", seq, rec->event_type, rec->u.ev.pid);
 
   memcpy(&ring[seq & RING_MASK], rec, sizeof(*rec));
 
@@ -99,7 +102,6 @@ void flush_partial_batch(void) {
   unsigned long flags;
   unsigned int count;
   struct audit_record *batch_copy;
-  unsigned long aflags;
 
   spin_lock_irqsave(&ring_lock, flags);
   if (batch_count == 0) {
@@ -107,6 +109,8 @@ void flush_partial_batch(void) {
     return;
   }
   count = batch_count;
+
+  pr_debug("flushing partial batch count=%u\n", count);
 
   batch_copy = kmalloc(count * sizeof(struct audit_record), GFP_ATOMIC);
   if (unlikely(!batch_copy)) {

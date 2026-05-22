@@ -121,7 +121,8 @@ static int ratchet_key(void) {
   ret = crypto_shash_setkey(tfm_hmac, K_current, HMAC_KEY_SIZE);
   if (unlikely(ret))
     pr_err("ratchet: setkey failed: %d\n", ret);
-  pr_info("key ratcheted\n");
+  else 
+      pr_debug("key ratcheted successfully\n");
   return ret;
 }
 
@@ -191,6 +192,8 @@ struct batch_crypto_record *batch_hash_sign(struct audit_record *batch,
     pr_err("batch_hash_sign: sha256 final failed: %d\n", ret);
     goto err_free_desc;
   }
+
+  pr_debug("batch sha256 done count=%u\n", count);
 
   memcpy(rec->hash, digest, BATCH_HASH_SIZE);
 
