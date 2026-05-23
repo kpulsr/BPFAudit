@@ -57,18 +57,22 @@ int bpfaudit_set_hmac_key(const u8 *key, size_t len) {
     return -EINVAL;
 
   /* allocate TFMs once if not yet done */
-  if (!tfm_hmac) {
+  if (unlikely(!tfm_hmac)) {
     tfm_hmac = crypto_alloc_shash("hmac(sha256)", 0, 0);
-    if (IS_ERR(tfm_hmac)) {
+    if (unlikely(IS_ERR(tfm_hmac))) {
+      int err = PTR_ERR(tfm_hmac); 
       tfm_hmac = NULL;
-      return PTR_ERR(tfm_hmac);
+      return err;
     }
   }
-  if (!tfm_sha256) {
+  if (unlikely(!tfm_sha256)) {
     tfm_sha256 = crypto_alloc_shash("sha256", 0, 0);
-    if (IS_ERR(tfm_sha256)) {
+    if (unlikely(IS_ERR(tfm_sha256))) {
+      int err = PTR_ERR(tfm_sha256);
+      crypto_free_shash(tfm_hmac);
       tfm_sha256 = NULL;
-      return PTR_ERR(tfm_sha256);
+      tfm_hmac = NULL;
+      return err;
     }
   }
 
@@ -86,11 +90,11 @@ void bpfaudit_crypto_zeroize(void) {
   memzero_explicit(K_current, HMAC_KEY_SIZE);
   K_ready = false;
   spin_unlock_irqrestore(&key_lock, flags);
-  if (tfm_hmac) {
+  if (likely(tfm_hmac)) {
     crypto_free_shash(tfm_hmac);
     tfm_hmac = NULL;
   }
-  if (tfm_sha256) {
+  if (likely(tfm_sha256)) {
     crypto_free_shash(tfm_sha256);
     tfm_sha256 = NULL;
   }
