@@ -14,6 +14,9 @@ bpfledger-y := src/bpfledger_main.o \
                src/bpfaudit_crypto.o \
                src/bpfaudit_heartbeat.o
 
+debug: ccflags-y += -DDEBUG
+
+debug: module
 
 all: module
 

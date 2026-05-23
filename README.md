@@ -174,7 +174,7 @@ sudo keyctl add logon bpfaudit:hmac "$(cat /tmp/audit.key)" @s
 make module && make load
 
 # 3. Run attestor
-sudo AUDIT_HMAC_KEY=$(cat /tmp/audit.key) ./attestor
+sudo AUDIT_HMAC_KEY=$(sudo xxd -p /etc/bpfaudit/hmac.key | tr -d '\n') ./attestor
 
 # 4. Run daemon
 ./bpfaudit-daemon
@@ -203,7 +203,11 @@ sudo keyctl revoke $(sudo keyctl search @s logon bpfaudit:hmac)
 
 > **Note:** passing `AUDIT_HMAC_KEY` as an environment variable is not production-safe — the key is visible in `/proc/<pid>/environ`. Future work: provision via Vault, TPM-sealed blob, or a dedicated key-agreement handshake over the mTLS channel.
 
----
+## Debug
+ 
+```
+echo 'module bpfledger +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+```
 
 ## Known limitations
 
