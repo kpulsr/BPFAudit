@@ -4,7 +4,7 @@ on: [push, pull_request]
 env:
   MODULE: bpfledger
   FAIL_RE: "BUG:|WARNING:|KASAN:|UBSAN:|general protection fault|RCU stall"
-  KERNEL_DEB: "https://kernel.ubuntu.com/mainline/v6.8.12/amd64/linux-image-unsigned-6.8.12-060812-generic_6.8.12-060812.202407311137_amd64.deb"
+  KERNEL_DEB: "https://kernel.ubuntu.com/mainline/v6.17/amd64/linux-image-unsigned-6.17.0-061700-generic_6.17.0-061700.202509282239_amd64.deb"
 
 defaults:
   run:
