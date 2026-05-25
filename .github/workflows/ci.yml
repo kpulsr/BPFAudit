@@ -93,7 +93,7 @@ jobs:
           mount -t proc none /proc
           mount -t sysfs none /sys
           mount -t devtmpfs none /dev
-          keyctl new_session
+          keyctl session bash -c '
           keyctl padd logon bpfaudit:hmac @s < /hmackey
           echo "=== lifecycle 50x ==="
           for i in $(seq 1 50); do
@@ -109,8 +109,6 @@ jobs:
               rmmod bpfledger 2>/dev/null || true
             done
             echo 0 > /sys/kernel/debug/failslab/probability
-          else
-            echo "failslab unavailable"
           fi
           echo "=== read-path fuzz ==="
           insmod /lib/modules/bpfledger.ko
@@ -124,6 +122,7 @@ jobs:
           echo "=== dmesg ==="
           dmesg
           poweroff -f
+          '
           EOF
 
           chmod +x r/init
