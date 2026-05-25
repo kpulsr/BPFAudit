@@ -93,6 +93,7 @@ jobs:
           mount -t proc none /proc
           mount -t sysfs none /sys
           mount -t devtmpfs none /dev
+          keyctl new_session
           keyctl padd logon bpfaudit:hmac @s < /hmackey
           echo "=== lifecycle 50x ==="
           for i in $(seq 1 50); do
