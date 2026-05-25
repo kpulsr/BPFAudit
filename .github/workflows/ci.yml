@@ -66,6 +66,10 @@ jobs:
         run: |
           mkdir -p r/{bin,dev,proc,sys,lib/modules}
           cp ledger/build/bpfledger.ko r/lib/modules/
+
+          cp /usr/bin/busybox r/bin/busybox
+          r/bin/busybox --install r/bin/
+          
           printf '%032d' 0 > r/hmackey
 
           cat > r/init << 'EOF'
