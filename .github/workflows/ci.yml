@@ -1,0 +1,144 @@
+name: LKM-CI
+on: [push, pull_request]
+
+env:
+  MODULE: bpfledger
+  KO: ledger/build/bpfledger.ko
+  FAIL_RE: "BUG:|WARNING:|KASAN:|UBSAN:|general protection fault|RCU stall"
+
+jobs:
+  static:
+    name: Sparse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y --no-install-recommends build-essential clang sparse linux-headers-$(uname -r)
+      - run: make C=1 CHECK=sparse -C ledger
+
+  build:
+    name: Build (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get install -y --no-install-recommends build-essential clang linux-headers-$(uname -r)
+      - run: make CC=${{ matrix.cc }} -j$(nproc) -C ledger
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ko-${{ matrix.cc }}
+          path: ledger/build/bpfledger.ko
+
+  test:
+    name: Test
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: ko-gcc }
+
+      - name: Deps
+        run: sudo apt-get install -y --no-install-recommends stress-ng keyutils
+
+      - name: HMAC key
+        run: printf '%032d' 0 | sudo keyctl padd logon bpfaudit:hmac @s
+
+      - name: Lifecycle (50×)
+        run: |
+          for i in $(seq 1 50); do
+            sudo insmod bpfledger.ko
+            sudo rmmod  ${MODULE}
+          done
+
+      - name: Stress (load + CPU)
+        run: |
+          stress-ng --cpu $(nproc) --timeout 20s &
+          for i in $(seq 1 20); do
+            sudo insmod bpfledger.ko
+            stress-ng --cpu 2 --timeout 2s
+            sudo rmmod  ${MODULE}
+          done; wait
+
+      - name: failslab injection
+        run: |
+          sudo bash -c "
+            echo 1  > /sys/kernel/debug/failslab/ignore-gfp-wait
+            echo 10 > /sys/kernel/debug/failslab/probability
+            echo 50 > /sys/kernel/debug/failslab/times"
+          for i in $(seq 1 30); do
+            sudo insmod bpfledger.ko 2>/dev/null || true
+            sudo rmmod  ${MODULE}    2>/dev/null || true
+          done
+          sudo bash -c "echo 0 > /sys/kernel/debug/failslab/probability"
+
+      - name: Read-path fuzz
+        run: |
+          sudo insmod bpfledger.ko
+          for i in $(seq 1 300); do
+            bs=$(( (RANDOM % 512) + 1 ))
+            timeout 0.1s dd if=/dev/${MODULE} bs=$bs  count=4 iflag=nonblock of=/dev/null 2>/dev/null &
+            timeout 0.1s dd if=/dev/${MODULE} bs=152  count=1                of=/dev/null 2>/dev/null &
+            timeout 0.1s dd if=/dev/${MODULE} bs=1    count=8 iflag=nonblock of=/dev/null 2>/dev/null &
+          done; wait
+          sudo rmmod ${MODULE}
+
+      - name: dmesg check
+        run: dmesg | tee dmesg.log | (! grep -E "$FAIL_RE")
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dmesg
+          path: dmesg.log
+
+  qemu:
+    name: QEMU / debug kernel
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: ko-gcc }
+
+      - name: Deps
+        run: sudo apt-get install -y --no-install-recommends qemu-system-x86 wget cpio gzip
+
+      - name: Fetch mainline kernel (6.8)
+        run: |
+          BASE=https://kernel.ubuntu.com/mainline/v6.8/amd64
+          wget -q $BASE/linux-image-unsigned-6.8.0-060800-generic_6.8.0-060800.202403151937_amd64.deb
+          dpkg-deb -x linux-image-*.deb kpkg/
+          cp kpkg/boot/vmlinuz-* vmlinuz
+
+      - name: Build initrd
+        run: |
+          mkdir -p r/{bin,dev,proc,sys,lib/modules}
+          cp bpfledger.ko r/lib/modules/
+          printf '%032d' 0 > r/hmackey
+          cat > r/init << 'INIT'
+          #!/bin/sh
+          mount -t proc none /proc; mount -t sysfs none /sys; mount -t devtmpfs none /dev
+          keyctl padd logon bpfaudit:hmac @s < /hmackey
+          insmod /lib/modules/bpfledger.ko
+          sleep 2; rmmod bpfledger
+          dmesg; poweroff -f
+          INIT
+          chmod +x r/init
+          (cd r && find . | cpio -H newc -o | gzip > ../initrd)
+
+      - name: Boot (90s timeout)
+        timeout-minutes: 2
+        run: |
+          timeout 90s qemu-system-x86_64 \
+            -m 512 -kernel vmlinuz -initrd initrd -nographic -no-reboot \
+            -append "console=ttyS0 nokaslr panic=5" | tee qemu.log || true
+
+      - name: Check QEMU log
+        run: "! grep -E 'BUG:|KASAN:|Kernel panic' qemu.log"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qemu-log
+          path: qemu.log
