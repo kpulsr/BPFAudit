@@ -34,7 +34,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends build-essential linux-headers-$(uname -r)
-      - run: make CC=gcc -j$(nproc) -C ledger
+
+          # Fetch the matching headers .deb for 6.17
+          wget -q https://kernel.ubuntu.com/mainline/v6.17/amd64/linux-headers-6.17.0-061700-generic_6.17.0-061700.202509282239_amd64.deb
+          wget -q https://kernel.ubuntu.com/mainline/v6.17/amd64/linux-headers-6.17.0-061700_6.17.0-061700.202509282239_all.deb
+          sudo dpkg -i linux-headers-6.17.0-061700_*.deb linux-headers-6.17.0-061700-generic_*.deb
+
+      - name: Build module against 6.17
+        run: make CC=gcc -j$(nproc) -C ledger KDIR=/usr/src/linux-headers-6.17.0-061700-generic
+
+        
       - uses: actions/upload-artifact@v4
         with:
           name: ko-gcc
