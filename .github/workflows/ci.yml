@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cc: [gcc, clang]
+        cc: [gcc]
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get install -y --no-install-recommends build-essential clang linux-headers-$(uname -r)

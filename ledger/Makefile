@@ -15,20 +15,14 @@ bpfledger-y := src/bpfledger_main.o \
                src/bpfaudit_heartbeat.o
 
 debug: ccflags-y += -DDEBUG
-debug: module
-all: module
 
-ifeq ($(CC),clang)
-KBUILD_EXTRA := CC=clang HOSTCC=clang \
-                KCFLAGS="-fno-sanitize=bounds-strict -fno-conserve-stack" \
-                KBUILD_CFLAGS_MODULE=""
-else
-KBUILD_EXTRA :=
-endif
+debug: module
+
+all: module
 
 module:
 	mkdir -p $(BUILD)
-	$(MAKE) -C $(KDIR) M=$(PWD) MO=$(BUILD) $(KBUILD_EXTRA) modules
+	$(MAKE) -C $(KDIR) M=$(PWD) MO=$(BUILD) modules
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) MO=$(BUILD) clean
@@ -48,3 +42,5 @@ log:
 	sudo dmesg | grep bpfledger | tail -20
 
 .PHONY: all module clean load unload reload log
+
+
