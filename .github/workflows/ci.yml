@@ -78,6 +78,13 @@ jobs:
 
           cp /usr/bin/busybox r/bin/busybox
           r/bin/busybox --install r/bin/
+
+          cp /usr/bin/keyctl r/bin/
+          for lib in $(ldd /usr/bin/keyctl | grep -oP '/\S+\.so\S*'); do
+            cp --parents "$lib" r/ 2>/dev/null || true
+          done
+
+          cp --parents /lib64/ld-linux-x86-64.so.2 r/ 2>/dev/null || true
           
           printf '%032d' 0 > r/hmackey
 
