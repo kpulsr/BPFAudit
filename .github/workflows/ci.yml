@@ -41,7 +41,7 @@ jobs:
           sudo dpkg -i linux-headers-6.17.0-061700_*.deb linux-headers-6.17.0-061700-generic_*.deb
 
       - name: Build module against 6.17
-        run: make CC=gcc -j$(nproc) -C ledger KDIR=/usr/src/linux-headers-6.17.0-061700-generic
+        run: make CC=gcc-14 -j$(nproc) -C ledger KDIR=/usr/src/linux-headers-6.17.0-061700-generic
 
         
       - uses: actions/upload-artifact@v4
