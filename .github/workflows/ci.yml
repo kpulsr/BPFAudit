@@ -3,8 +3,8 @@ on: [push, pull_request]
 
 env:
   MODULE: bpfledger
-  FAIL_RE: 'BUG:|WARNING:|KASAN:|UBSAN:|general protection fault|RCU stall'
-  KERNEL_DEB: 'https://kernel.ubuntu.com/mainline/v6.8.12/amd64/linux-image-unsigned-6.8.12-060812-generic_6.8.12-060812.202407311137_amd64.deb'
+  FAIL_RE: "BUG:|WARNING:|KASAN:|UBSAN:|general protection fault|RCU stall"
+  KERNEL_DEB: "https://kernel.ubuntu.com/mainline/v6.8.12/amd64/linux-image-unsigned-6.8.12-060812-generic_6.8.12-060812.202407311137_amd64.deb"
 
 defaults:
   run:
@@ -64,57 +64,50 @@ jobs:
       - name: Build initrd
         run: |
           mkdir -p r/{bin,dev,proc,sys,lib/modules}
-          # artifact preserves the original relative path
           cp ledger/build/bpfledger.ko r/lib/modules/
           printf '%032d' 0 > r/hmackey
 
-          cat > r/init << 'INIT'
-#!/bin/sh
-mount -t proc none /proc
-mount -t sysfs none /sys
-mount -t devtmpfs none /dev
-
-# Provision HMAC key
-keyctl padd logon bpfaudit:hmac @s < /hmackey
-
-echo "=== lifecycle 50x ==="
-for i in $(seq 1 50); do
-  insmod /lib/modules/bpfledger.ko && rmmod bpfledger || echo "cycle $i failed"
-done
-
-echo "=== failslab injection ==="
-if [ -d /sys/kernel/debug/failslab ]; then
-  echo 1  > /sys/kernel/debug/failslab/ignore-gfp-wait
-  echo 10 > /sys/kernel/debug/failslab/probability
-  echo 50 > /sys/kernel/debug/failslab/times
-  for i in $(seq 1 30); do
-    insmod /lib/modules/bpfledger.ko 2>/dev/null || true
-    rmmod bpfledger 2>/dev/null || true
-  done
-  echo 0 > /sys/kernel/debug/failslab/probability
-else
-  echo "failslab not available in this kernel config"
-fi
-
-echo "=== read-path fuzz ==="
-insmod /lib/modules/bpfledger.ko
-for i in $(seq 1 100); do
-  dd if=/dev/bpfledger bs=$(( ($RANDOM % 512) + 1 )) count=4 iflag=nonblock of=/dev/null 2>/dev/null &
-  dd if=/dev/bpfledger bs=152 count=1 of=/dev/null 2>/dev/null &
-  dd if=/dev/bpfledger bs=1   count=8 iflag=nonblock of=/dev/null 2>/dev/null &
-done
-wait
-rmmod bpfledger
-
-echo "=== dmesg ==="
-dmesg
-poweroff -f
-INIT
+          cat > r/init << 'EOF'
+          #!/bin/sh
+          mount -t proc none /proc
+          mount -t sysfs none /sys
+          mount -t devtmpfs none /dev
+          keyctl padd logon bpfaudit:hmac @s < /hmackey
+          echo "=== lifecycle 50x ==="
+          for i in $(seq 1 50); do
+            insmod /lib/modules/bpfledger.ko && rmmod bpfledger || echo "cycle $i failed"
+          done
+          echo "=== failslab ==="
+          if [ -d /sys/kernel/debug/failslab ]; then
+            echo 1  > /sys/kernel/debug/failslab/ignore-gfp-wait
+            echo 10 > /sys/kernel/debug/failslab/probability
+            echo 50 > /sys/kernel/debug/failslab/times
+            for i in $(seq 1 30); do
+              insmod /lib/modules/bpfledger.ko 2>/dev/null || true
+              rmmod bpfledger 2>/dev/null || true
+            done
+            echo 0 > /sys/kernel/debug/failslab/probability
+          else
+            echo "failslab unavailable"
+          fi
+          echo "=== read-path fuzz ==="
+          insmod /lib/modules/bpfledger.ko
+          i=0; while [ $i -lt 100 ]; do
+            dd if=/dev/bpfledger bs=152 count=1 of=/dev/null 2>/dev/null &
+            dd if=/dev/bpfledger bs=1   count=8 of=/dev/null 2>/dev/null &
+            i=$((i+1))
+          done
+          wait
+          rmmod bpfledger
+          echo "=== dmesg ==="
+          dmesg
+          poweroff -f
+          EOF
 
           chmod +x r/init
           (cd r && find . -print0 | cpio --null -H newc -o | gzip > ../initrd)
 
-      - name: Boot (120 s timeout)
+      - name: Boot (120s timeout)
         timeout-minutes: 3
         run: |
           timeout 120s qemu-system-x86_64 \
