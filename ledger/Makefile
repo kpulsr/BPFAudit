@@ -7,6 +7,14 @@ BUILD   := $(PWD)/build
 # Include headers
 ccflags-y += -I$(src)/include
 
+
+# Strip gcc-only flags when building with clang
+ifeq ($(CC),clang)
+  KBUILD_CFLAGS := $(filter-out -fconserve-stack,$(KBUILD_CFLAGS))
+  KBUILD_CFLAGS := $(filter-out -fsanitize=bounds-strict,$(KBUILD_CFLAGS))
+  KBUILD_CFLAGS := $(filter-out -mrecord-mcount,$(KBUILD_CFLAGS))
+endif
+
 # Kernel module
 obj-m := bpfledger.o
 bpfledger-y := src/bpfledger_main.o \
