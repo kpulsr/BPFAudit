@@ -49,6 +49,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: ko-gcc
+          path: ledger/build/
 
       - name: Install QEMU deps
         run: |
