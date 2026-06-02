@@ -31,6 +31,7 @@
 #include <linux/uidgid.h>
 #include <linux/wait.h>
 #include <net/sock.h>
+#include <linux/file.h> 
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Meriah Ibrahim Abderrahim");
@@ -364,6 +365,8 @@ static int fp_bpf_link_free(struct fprobe *fp, unsigned long ip,
   if (likely(link && link->prog && link->prog->aux)) {
     if (link->type == BPF_LINK_TYPE_PERF_EVENT)
       return 0;
+    if (link->type == BPF_LINK_TYPE_RAW_TRACEPOINT)
+      return 0;
     emit_prog_event(link->prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_FPROBE);
   }
   return 0;
@@ -417,24 +420,45 @@ static struct kprobe kp_perf_event_detach = {
  */
 static int fp_bpf_obj_pin_user(struct fprobe *fp, unsigned long ip,
                                unsigned long ret_ip, struct ftrace_regs *fregs,
-                               void *data) {
-  char __user *pathname;
-  struct audit_record rec;
-  long ret;
+                               void *data)
+{
+    char __user *pathname;
+    struct audit_record rec;
+    struct bpf_prog *prog;
+    struct file *f;
+    u32 ufd;
+    long ret;
 
-  memset(&rec, 0, sizeof(rec));
-  get_task_comm(rec.u.ev.comm, current);
-  fill_process_ctx(&rec);
-  rec.event_type = AUDIT_EVENT_PIN;
-  rec.source = AUDIT_SOURCE_FPROBE;
+    memset(&rec, 0, sizeof(rec));
+    get_task_comm(rec.u.ev.comm, current);
+    fill_process_ctx(&rec);
+    rec.event_type = AUDIT_EVENT_PIN;
+    rec.source     = AUDIT_SOURCE_FPROBE;
 
-  pathname = (char __user *)ftrace_regs_get_argument(fregs, 1);
-  ret = strncpy_from_user(rec.u.ev.path, pathname, sizeof(rec.u.ev.path) - 1);
-  if (unlikely(ret < 0))
-    rec.u.ev.path[0] = '\0';
+    ufd = (u32)ftrace_regs_get_argument(fregs, 0);
 
-  native_submit_event(&rec);
-  return 0;
+    f = fget(ufd);
+    if (f) {
+        prog = (struct bpf_prog *)f->private_data;
+        if (prog) {
+            rec.u.ev.prog_id   = prog->aux->id;
+            rec.u.ev.prog_type = prog->type;
+            memcpy(rec.u.ev.prog_tag, prog->tag, AUDIT_PROG_TAG_SIZE);
+        }
+        fput(f);
+    }
+
+    pathname = (char __user *)ftrace_regs_get_argument(fregs, 2);
+    ret = strncpy_from_user(rec.u.ev.path, pathname, sizeof(rec.u.ev.path) - 1);
+    if (unlikely(ret < 0))
+        rec.u.ev.path[0] = '\0';
+
+    native_submit_event(&rec);
+    pr_debug("event: prog_id=%u type=%u event=%u source=%u pid=%u path=%s\n",
+         rec.u.ev.prog_id, rec.u.ev.prog_type,
+         rec.event_type, rec.source, current->pid,
+         rec.u.ev.path);
+    return 0;
 }
 static struct fprobe fps_bpf_obj_pin_user = {.entry_handler =
                                                  fp_bpf_obj_pin_user};
@@ -488,12 +512,14 @@ static struct fprobe fps_cgroup_bpf_detach = {.entry_handler =
  */
 static int kp_bpf_probe_register_handler(struct kprobe *p,
                                          struct pt_regs *regs) {
-  struct bpf_prog *prog = (struct bpf_prog *)regs_get_kernel_argument(regs, 1);
-  if (unlikely(!prog || !prog->aux || !prog->aux->id))
-    return 0;
-  if (is_feature_probe(prog))
-    return 0;
-  emit_prog_event(prog, AUDIT_EVENT_ATTACH, AUDIT_SOURCE_KPROBE);
+  //struct bpf_prog *prog = (struct bpf_prog *)regs_get_kernel_argument(regs, 1);
+  struct bpf_link *link =
+      (struct bpf_link *)regs_get_kernel_argument(regs, 1);
+  if (unlikely(!link || !link->prog || !link->prog->aux || !link->prog->aux->id))
+      return 0; 
+  if (is_feature_probe(link->prog))
+      return 0; 
+   emit_prog_event(link->prog, AUDIT_EVENT_ATTACH, AUDIT_SOURCE_KPROBE);
   return 0;
 }
 static struct kprobe kp_bpf_probe_register = {
@@ -508,11 +534,12 @@ static struct kprobe kp_bpf_probe_register = {
  */
 static int kp_bpf_probe_unregister_handler(struct kprobe *p,
                                            struct pt_regs *regs) {
-  struct bpf_prog *prog = (struct bpf_prog *)regs_get_kernel_argument(regs, 1);
-  if (unlikely(!prog || !prog->aux || !prog->aux->id))
+    struct bpf_link *link =
+        (struct bpf_link *)regs_get_kernel_argument(regs, 1);
+    if (unlikely(!link || !link->prog || !link->prog->aux || !link->prog->aux->id))
+        return 0;
+    emit_prog_event(link->prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_KPROBE);
     return 0;
-  emit_prog_event(prog, AUDIT_EVENT_DETACH, AUDIT_SOURCE_KPROBE);
-  return 0;
 }
 static struct kprobe kp_bpf_probe_unregister = {
     .symbol_name = "bpf_probe_unregister",
@@ -891,7 +918,7 @@ static int __init bpfledger_init(void) {
   }
   init_flags |= FLAG_PROBE_PERF_DETACH;
 
-  ret = register_fprobe(&fps_perf_event_set, "perf_event_set_bpf_prog", NULL);
+  ret = register_fprobe(&fps_perf_event_set, "__perf_event_set_bpf_prog", NULL);
   if (ret) {
     pr_err("fprobe perf_event_set failed: %d\n", ret);
     goto fail;

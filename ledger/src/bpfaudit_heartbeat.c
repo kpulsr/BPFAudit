@@ -73,7 +73,7 @@ int __init bpfaudit_heartbeat_init(struct bpf_ring_ctx *ctx) {
   return 0;
 }
 
-void __exit bpfaudit_heartbeat_exit(void) {
+void bpfaudit_heartbeat_exit(void) {
   hrtimer_cancel(&hb_timer);
   bpfaudit_crypto_zeroize();
   pr_info("stopped, HMAC key zeroized\n");
