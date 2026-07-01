@@ -9,10 +9,18 @@ ccflags-y += -I$(src)/include
 
 # Kernel module
 obj-m := bpfledger.o
-bpfledger-y := src/bpfledger_main.o \
-               src/bpfledger_ring.o \
-               src/bpfaudit_crypto.o \
-               src/bpfaudit_heartbeat.o
+bpfledger-y := \
+    src/bpfledger_main.o \
+    src/bpfledger_ring.o \
+    src/bpfaudit_crypto.o \
+    src/bpfaudit_heartbeat.o \
+    src/common/emit.o \
+    src/common/process.o \
+    src/common/filter.o \
+    src/paths/program.o \
+    src/paths/attach/link.o \
+    src/paths/attach/legacy/prog_attach.o \
+    src/paths/attach/legacy/setsockopt.o
 
 debug: ccflags-y += -DDEBUG
 

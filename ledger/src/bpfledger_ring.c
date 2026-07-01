@@ -2,6 +2,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME "/ring: " fmt
 
 #include "bpfledger_ring.h"
+#include "bpfaudit_crypto.h"
 #include <linux/err.h>
 #include <linux/ktime.h>
 #include <linux/slab.h>
@@ -74,7 +75,8 @@ void native_submit_event(struct audit_record *rec) {
   rec->seq = seq;
   rec->timestamp_ns = ktime_get_ns();
 
-  pr_debug("event seq=%llu type=%u pid=%u\n", seq, rec->event_type, rec->u.ev.pid);
+  pr_debug("event seq=%llu type=%u pid=%u\n", seq, rec->event_type,
+           rec->u.ev.pid);
 
   memcpy(&ring[seq & RING_MASK], rec, sizeof(*rec));
 
