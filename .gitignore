@@ -82,3 +82,5 @@ coverage.out
 tmp/
 temp/
 daemon-audit
+
+notes/
